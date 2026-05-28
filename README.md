@@ -40,16 +40,16 @@ This script acts as a conductor for several heavy-duty AI tools. **You must have
    git clone [https://github.com/YourUsername/ShowaSync.git](https://github.com/YourUsername/ShowaSync.git)
    cd ShowaSync
 2. Install the required Python UI and API packages:
-    Bash
-    pip install -r requirements.txt
+   ```bash
+   pip install -r requirements.txt
 (Note: This installs textual, requests, and ollama.)
+
+---
 
 ## 🎮 Usage
 Launch the tool directly in your terminal from the folder containing your media or .srt files:
 
-```bash
-   python ShowaSync.py
-
+    python ShowaSync.py
 
 ## The Workflow:
 
