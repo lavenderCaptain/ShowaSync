@@ -1,0 +1,23 @@
+# Media and Temp Files
+*.mkv
+*.mp4
+*.ts
+*.avi
+*.mov
+*.wav
+*.vtt
+*.json
+*.tsv
+
+# Python Virtual Environments
+whisperx_env/
+venv/
+env/
+.env
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Subtitle Files (Optional: remove this if you WANT to upload your subtitles)
+*.srt
