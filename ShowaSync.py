@@ -18,7 +18,11 @@ except ImportError:
     Client = None
 
 class FilteredDirectoryTree(DirectoryTree):
-    """Filters the directory tree to only show relevant media and source SRT files."""
+    """
+    A custom DirectoryTree that filters out irrelevant system files.
+    Only displays directories, valid media files, and source SRTs.
+    Specifically hides output files (*-translated.srt, *-balanced.srt) to prevent infinite processing loops.
+    """
     def filter_paths(self, paths: list[Path]) -> list[Path]:
         valid_extensions = {".mp4", ".mkv", ".ts", ".avi", ".mov", ".srt"}
         return [
@@ -30,9 +34,12 @@ class FilteredDirectoryTree(DirectoryTree):
             )
         ]
 
-class SubtitleTUI(App):
-    """A Textual TUI for the Subtitle E2E Processing Suite."""
-    
+class ShowaSync(App):
+    """The main Textual Application for ShowaSync."""
+
+    # Overrides the default header text in the TUI
+    TITLE = "ShowaSync"
+
     CSS = """
     Screen { background: $surface; }
     #main_container { padding: 1 2; height: 100%; }
@@ -56,6 +63,7 @@ class SubtitleTUI(App):
     #telemetry_label { margin-top: 1; text-align: right; width: 100%; text-style: bold; color: $success; }
     """
 
+    # Global keyboard shortcuts
     BINDINGS = [
         ("q", "quit", "Quit Application"),
         ("p", "poll_models", "Poll Ollama"),
@@ -64,8 +72,9 @@ class SubtitleTUI(App):
 
     def __init__(self):
         super().__init__()
-        self.target_files = []
+        self.target_files = [] # Holds the absolute paths of queued files
         
+        # Translation context profiles to guide the LLM's tone and dialect
         self.profiles = {
             "Generic / Catch-all": "You are an expert Japanese-to-English subtitle translator. Translate the text naturally and professionally.",
             "Variety Show (Chaos)": "You are translating a Japanese variety show. Expect heavy slang, constant overlapping dialogue, and distinct visual on-screen text. Prioritize clarity and character separation.",
@@ -76,6 +85,7 @@ class SubtitleTUI(App):
         }
 
     def compose(self) -> ComposeResult:
+        """Constructs the UI layout."""
         yield Header(show_clock=True)
         
         with Vertical(id="main_container"):
@@ -116,7 +126,8 @@ class SubtitleTUI(App):
 
     def on_mount(self) -> None:
         """Runs immediately when the TUI boots."""
-        self.write_main_log("Application loaded. Polling Ollama in the background...")
+        self.write_main_log("ShowaSync loaded. Polling Ollama in the background...")
+        # Grab the default IP and hand off to the background thread to prevent UI freezing
         ip = self.query_one("#ollama_ip", Input).value.rstrip('/')
         self.poll_models_worker(ip)
 
@@ -137,12 +148,22 @@ class SubtitleTUI(App):
         self.write_main_log("[yellow]Queue cleared.[/yellow]")
 
     def action_poll_models(self) -> None:
-        """Triggered by pressing 'p'."""
+        """Triggered by pressing 'p'. Manually initiates a model poll."""
         ip = self.query_one("#ollama_ip", Input).value.rstrip('/')
         self.write_main_log(f"Initiating manual poll for {ip}...")
         self.poll_models_worker(ip)
 
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Routes button clicks to their respective async background workers."""
+        if event.button.id == "btn_start":
+            self.execute_pipeline_batch()
+        elif event.button.id == "btn_patch":
+            self.execute_patcher_batch()
+
     # --- Background Workers ---
+    # The @work decorator sends these functions to a background thread.
+    # Textual strictly forbids updating the UI directly from a background thread, 
+    # so we must use `self.call_from_thread()` to send data back to the main UI.
     @work(thread=True)
     def poll_models_worker(self, ip: str) -> None:
         """The background worker that safely talks to Ollama without freezing the UI."""
@@ -150,12 +171,14 @@ class SubtitleTUI(App):
             response = requests.get(f"{ip}/api/tags", timeout=5)
             response.raise_for_status()
             models = [m['name'] for m in response.json().get('models', [])]
+            # Send the data back to the main thread to update the Dropdown
             self.call_from_thread(self._update_model_select, models)
             self.write_thread_log(f"[green]Success. Found {len(models)} models.[/green]")
         except Exception as e:
             self.write_thread_log(f"[red]Error reaching Ollama: {e}[/red]")
 
     def _update_model_select(self, models: list) -> None:
+        """Updates the Model Dropdown (Must be run on the main thread)."""
         select = self.query_one("#model_select", Select)
         if models:
             select.set_options([(m, m) for m in models])
@@ -165,12 +188,15 @@ class SubtitleTUI(App):
 
     # --- Thread-Safe Logging & Telemetry ---
     def write_main_log(self, message: str) -> None:
+        """Logs text to the console directly from the MAIN UI thread."""
         self.query_one("#console", RichLog).write(message)
 
     def write_thread_log(self, message: str) -> None:
+        """Logs text to the console safely from a BACKGROUND worker thread."""
         self.call_from_thread(self.query_one("#console", RichLog).write, message)
 
     def update_telemetry(self, current: int, total: int, start_time: float) -> None:
+        """Calculates ETA and Speed, then requests a UI update."""
         if current == 0: return
         elapsed = time.time() - start_time
         avg_time = elapsed / current
@@ -182,11 +208,13 @@ class SubtitleTUI(App):
         self.call_from_thread(self._set_progress, pct, status_text)
 
     def _set_progress(self, pct: float, text: str) -> None:
+        """Updates the progress bar (Must be run on the main thread)."""
         self.query_one("#progress_bar", ProgressBar).progress = pct
         self.query_one("#telemetry_label", Label).update(text)
 
-    # --- Translation Pipeline Logic ---
+    # --- Data Parsing & Text Manipulation ---
     def get_base_prompt(self) -> str:
+        """Constructs the system prompt based on the user's selected profile."""
         profile_key = self.query_one("#profile_select", Select).value
         context = self.profiles.get(profile_key, "")
         return f"""{context}
@@ -196,27 +224,37 @@ CRITICAL LAWS OF RE-FORMATTING:
 3. Return ONLY the finished SRT block output. Do not include markdown blocks or notes."""
 
     def parse_srt_blocks(self, file_path: str) -> dict:
+        """Parses an SRT file into a dictionary mapped by its integer index."""
         if not os.path.exists(file_path): return {}
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read().strip()
+        # Split by double newline to separate subtitle blocks
         blocks = re.split(r'\n\s*\n', content)
         parsed = {}
         for b in blocks:
+            # Extract the leading integer index
             match = re.match(r'^(\d+)\n', b)
             if match: parsed[int(match.group(1))] = b
         return parsed
 
     def time_to_ms(self, t_str: str) -> int:
+        """Converts SRT timestamp format (HH:MM:SS,MMM) to pure milliseconds for math operations."""
         h, m, s, ms = map(int, re.split('[:,]', t_str))
         return (h * 3600000) + (m * 60000) + (s * 1000) + ms
 
     def ms_to_time(self, ms: int) -> str:
+        """Converts pure milliseconds back into the SRT timestamp format."""
         td = timedelta(milliseconds=ms)
         h, rem = divmod(int(td.total_seconds()), 3600)
         m, s = divmod(rem, 60)
         return f"{h:02}:{m:02}:{s:02},{ms % 1000:03}"
 
     def rebalance_srt_file(self, input_srt: str) -> None:
+        """
+        Scans a translated SRT file for lines that are too long (often caused by VAD failures).
+        Mathematically splits the text near the center punctuation, calculates a proportional 
+        time ratio based on string length, and cascades the new timestamps.
+        """
         self.write_thread_log(f"Rebalancing {os.path.basename(input_srt)}...")
         blocks = self.parse_srt_blocks(input_srt)
         new_blocks, new_index = [], 1
@@ -229,12 +267,14 @@ CRITICAL LAWS OF RE-FORMATTING:
             time_line = lines[1]
             clean_text = "\n".join(lines[2:]).replace('\n', ' ').strip()
             
+            # Target threshold for splitting (85 chars is approx 2 full cinematic lines)
             if len(clean_text) > 85:
                 t_match = re.search(r'(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})', time_line)
                 if t_match:
                     start_ms, end_ms = self.time_to_ms(t_match.group(1)), self.time_to_ms(t_match.group(2))
                     dur = end_ms - start_ms
                     
+                    # Search for safe punctuation near the center to split on
                     mid = len(clean_text) // 2
                     split_idx = mid
                     for i in range(mid, len(clean_text)):
@@ -243,6 +283,8 @@ CRITICAL LAWS OF RE-FORMATTING:
                             break
                             
                     part1, part2 = clean_text[:split_idx].strip(), clean_text[split_idx:].strip()
+                    
+                    # Calculate new timestamps based on string length ratio to preserve reading speed
                     ratio = len(part1) / len(clean_text) if len(clean_text) > 0 else 0.5
                     mid_time = int(start_ms + (dur * ratio))
                     
@@ -251,6 +293,7 @@ CRITICAL LAWS OF RE-FORMATTING:
                     new_index += 2
                     continue
             
+            # If no split was needed, just preserve the block and update the index
             new_blocks.append(f"{new_index}\n{time_line}\n{chr(10).join(lines[2:])}")
             new_index += 1
 
@@ -259,16 +302,12 @@ CRITICAL LAWS OF RE-FORMATTING:
             f.write("\n\n".join(new_blocks))
         self.write_thread_log(f"Rebalanced file saved: {os.path.basename(out_file)}")
 
-    # --- Button Routing ---
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "btn_start":
-            self.execute_pipeline_batch()
-        elif event.button.id == "btn_patch":
-            self.execute_patcher_batch()
 
-    # --- Threaded Execution Engine ---
+    # --- Primary Execution Engine ---
+
     @work(thread=True)
     def execute_pipeline_batch(self) -> None:
+        """The main chronological pipeline for Audio Extraction -> Transcribing -> Translating."""
         if not self.target_files:
             self.write_thread_log("[red]ERROR: No files selected in queue.[/red]")
             return
@@ -289,18 +328,21 @@ CRITICAL LAWS OF RE-FORMATTING:
             
             wav_out = f"{file_root}_16k_mono.wav"
             
+            # Step 1: Normalize audio for Whisper's neural net requirements
             if run_ffmpeg and ext.lower() in ['.mkv', '.mp4', '.ts', '.avi', '.mov']:
                 self.write_thread_log("Extracting audio via FFmpeg...")
                 subprocess.run(["ffmpeg", "-i", target, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav_out, "-y"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 target = wav_out
                 self.write_thread_log("[green]FFmpeg extraction complete.[/green]")
 
+            # Step 2: Generate Japanese SRT Source
             if run_whisper and target.endswith('.wav'):
                 self.write_thread_log("Running WhisperX (Generating Source SRT)...")
                 subprocess.run(["whisperx", target, "--model", "large-v3", "--language", "ja", "--max_line_width", "40", "--max_line_count", "2", "--compute_type", "float16", "--output_format", "srt"])
                 target = f"{file_root}_16k_mono.srt"
                 self.write_thread_log("[green]WhisperX transcription complete.[/green]")
 
+            # Step 3: Batch translation to avoid LLM context memory limits
             if run_translate and target.endswith('.srt'):
                 if not Client:
                     self.write_thread_log("[red]ERROR: 'ollama' package missing.[/red]")
@@ -313,7 +355,7 @@ CRITICAL LAWS OF RE-FORMATTING:
                 blocks = list(self.parse_srt_blocks(target).values())
                 if not blocks: continue
 
-                chunk_size = 20
+                chunk_size = 20 # <-- THIS VALUE IS KEY FOR BALANCING CONTEXT LIMITS VS SPEED. Adjust as needed based on your model's capabilities. (i.e. make smaller if you find chunks are incomplete)
                 total_batches = (len(blocks) // chunk_size) + (1 if len(blocks) % chunk_size != 0 else 0)
                 
                 self.call_from_thread(self._set_progress, 0, "Status: Warming up LLM... | ETA: Calculating...")
@@ -332,8 +374,9 @@ CRITICAL LAWS OF RE-FORMATTING:
                                     {"role": "system", "content": self.get_base_prompt()},
                                     {"role": "user", "content": f"<subtitles>\n{batch_text}\n</subtitles>"}
                                 ],
-                                options={"temperature": 0.2, "num_predict": -1}
+                                options={"temperature": 0.2, "num_ctx": 16384, "num_predict": -1}
                             )
+                            # Sanitize output by stripping potential Markdown formatting added by the model
                             clean_out = response['message']['content'].replace('```srt','').replace('```','').strip()
                             f_out.write(clean_out + "\n\n")
                         except Exception as e:
@@ -344,9 +387,11 @@ CRITICAL LAWS OF RE-FORMATTING:
                 self.call_from_thread(self._set_progress, 100, "Status: Translation Complete | Speed: 0 | ETA: 00:00:00")
                 target = output_srt
 
+            # Step 4: Rebalance massive walls of text
             if run_rebalance and target.endswith('.srt'):
                 self.rebalance_srt_file(target)
 
+            # Step 5: Clean up large temp audio and leftover Whisper logs
             if run_clean:
                 self.write_thread_log("Cleaning up temp files...")
                 if os.path.exists(wav_out): os.remove(wav_out)
@@ -358,6 +403,12 @@ CRITICAL LAWS OF RE-FORMATTING:
 
     @work(thread=True)
     def execute_patcher_batch(self) -> None:
+        """
+        The Dynamic Patcher. 
+        Compares the translated output against the Japanese source. If the LLM dropped an index, 
+        it builds a contextual sandbox using the surrounding english lines, translates just the missing 
+        Japanese line, and surgically re-inserts it into the array to restore file integrity.
+        """
         if not self.target_files:
             self.write_thread_log("[red]ERROR: No files selected.[/red]")
             return
@@ -368,11 +419,13 @@ CRITICAL LAWS OF RE-FORMATTING:
         for target in self.target_files:
             if not target.endswith('.srt'): continue
             
+            # Auto-locate the paired translation file
             if not target.endswith('-translated.srt'):
                 trans_file = target.replace('.srt', '-translated.srt')
                 if not os.path.exists(trans_file): continue
                 target = trans_file
 
+            # Auto-locate the paired Japanese source file
             file_root = target.replace('-translated.srt', '')
             source_jp = f"{file_root}_16k_mono.srt"
             if not os.path.exists(source_jp):
@@ -382,7 +435,8 @@ CRITICAL LAWS OF RE-FORMATTING:
             self.write_thread_log(f"\n[bold yellow]=== INITIATING SURGICAL PATCHER: {os.path.basename(target)} ===[/bold yellow]")
             jp_blocks = self.parse_srt_blocks(source_jp)
             eng_blocks = self.parse_srt_blocks(target)
-            
+
+            # Find integer IDs that exist in the Japanese source but are missing in the English output            
             missing_indices = sorted(list(set(jp_blocks.keys()) - set(eng_blocks.keys())))
             
             if not missing_indices:
@@ -414,14 +468,15 @@ Translate the missing Japanese block so it flows perfectly. Output ONLY the comp
                     res = ollama_client.chat(
                         model=model,
                         messages=[{"role": "user", "content": patch_prompt + f"\n\n{jp_text}"}],
-                        options={"temperature": 0.2}
+                        options={"temperature": 0.2, "num_ctx": 16384}
                     )
                     eng_blocks[missing_idx] = res['message']['content'].replace('```srt','').replace('```','').strip()
                 except Exception as e:
                     self.write_thread_log(f"[red]API Error on index {missing_idx}: {e}[/red]")
                 
                 self.update_telemetry(current_num, total, start_time)
-                
+            
+            # Merge the newly translated blocks and completely rewrite the file
             with open(target, 'w', encoding='utf-8') as f:
                 for idx in sorted(eng_blocks.keys()):
                     f.write(eng_blocks[idx] + "\n\n")
@@ -430,5 +485,5 @@ Translate the missing Japanese block so it flows perfectly. Output ONLY the comp
             self.write_thread_log(f"[green]Patching complete for {os.path.basename(target)}.[/green]")
 
 if __name__ == "__main__":
-    app = SubtitleTUI()
+    app = ShowaSync()
     app.run()
