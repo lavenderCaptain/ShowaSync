@@ -24,7 +24,7 @@ class FilteredDirectoryTree(DirectoryTree):
     Specifically hides output files (*-translated.srt, *-balanced.srt) to prevent infinite processing loops.
     """
     def filter_paths(self, paths: list[Path]) -> list[Path]:
-        valid_extensions = {".mp4", ".mkv", ".ts", ".avi", ".mov", ".srt"}
+        valid_extensions = {".mp4", ".mkv", ".ts", ".avi", ".mov", ".srt", ".m4v"}
         return [
             path for path in paths
             if path.is_dir() or (
@@ -37,25 +37,21 @@ class FilteredDirectoryTree(DirectoryTree):
 class ShowaSync(App):
     """The main Textual Application for ShowaSync."""
 
-    # Overrides the default header text in the TUI
     TITLE = "ShowaSync"
 
     CSS = """
     Screen { background: $surface; }
     #main_container { padding: 1 2; height: 100%; }
     
-    /* Layouts */
     .config_row { height: auto; margin-bottom: 1; layout: horizontal; }
     .file_browser_container { height: 15; layout: horizontal; margin-bottom: 1;}
     .checkbox_col { width: 1fr; height: auto; border: round $primary; padding: 1; margin-right: 1;}
     .action_row { height: auto; margin-top: 1; margin-bottom: 1; layout: horizontal; align: center middle;}
     
-    /* Strict Widths to prevent UI collapse */
     #ollama_ip { width: 35; }
     #model_select { width: 35; }
     #profile_select { width: 1fr; }
     
-    /* Components */
     #tree_view { width: 60%; height: 100%; border: solid $accent; }
     #queue_view { width: 40%; height: 100%; border: solid $secondary; margin-left: 1;}
     Button { margin: 0 1; }
@@ -63,7 +59,6 @@ class ShowaSync(App):
     #telemetry_label { margin-top: 1; text-align: right; width: 100%; text-style: bold; color: $success; }
     """
 
-    # Global keyboard shortcuts
     BINDINGS = [
         ("q", "quit", "Quit Application"),
         ("p", "poll_models", "Poll Ollama"),
@@ -72,9 +67,8 @@ class ShowaSync(App):
 
     def __init__(self):
         super().__init__()
-        self.target_files = [] # Holds the absolute paths of queued files
+        self.target_files = [] 
         
-        # Translation context profiles to guide the LLM's tone and dialect
         self.profiles = {
             "Generic / Catch-all": "You are an expert Japanese-to-English subtitle translator. Translate the text naturally and professionally.",
             "Variety Show (Chaos)": "You are translating a Japanese variety show. Expect heavy slang, constant overlapping dialogue, and distinct visual on-screen text. Prioritize clarity and character separation.",
@@ -85,23 +79,19 @@ class ShowaSync(App):
         }
 
     def compose(self) -> ComposeResult:
-        """Constructs the UI layout."""
         yield Header(show_clock=True)
         
         with Vertical(id="main_container"):
-            # 1. Config Row
             with Horizontal(classes="config_row"):
                 yield Input(value="http://127.0.0.1:11434", id="ollama_ip", placeholder="Ollama URL")
                 yield Select([("Waiting for poll...", "Waiting...")], id="model_select")
                 yield Select([(k, k) for k in self.profiles.keys()], value="Generic / Catch-all", id="profile_select")
             
-            # 2. File Browser & Queue
             yield Label("Select files using arrow keys + Enter (Press 'c' to clear queue):", id="file_instruction")
             with Horizontal(classes="file_browser_container"):
                 yield FilteredDirectoryTree(Path("."), id="tree_view")
                 yield ListView(id="queue_view")
             
-            # 3. Pipeline Toggles
             with Horizontal(classes="config_row"):
                 with Vertical(classes="checkbox_col"):
                     yield Checkbox("1. FFmpeg (16kHz Mono)", value=True, id="chk_ffmpeg")
@@ -111,7 +101,6 @@ class ShowaSync(App):
                     yield Checkbox("4. Auto-Rebalance Lines", value=True, id="chk_rebalance")
                     yield Checkbox("5. Cleanup Temp Files", value=True, id="chk_cleanup")
 
-            # 4. Actions & Telemetry
             with Horizontal(classes="action_row"):
                 yield Button("VERIFY & PATCH GAPS", id="btn_patch", variant="warning")
                 yield Button("START BATCH PIPELINE", id="btn_start", variant="success")
@@ -119,66 +108,75 @@ class ShowaSync(App):
             yield ProgressBar(total=100, show_eta=False, id="progress_bar")
             yield Label("Status: Idle | Speed: -- | ETA: --:--:--", id="telemetry_label")
 
-            # 5. Console
             yield RichLog(id="console", highlight=True, markup=True)
             
         yield Footer()
 
     def on_mount(self) -> None:
-        """Runs immediately when the TUI boots."""
         self.write_main_log("ShowaSync loaded. Polling Ollama in the background...")
-        # Grab the default IP and hand off to the background thread to prevent UI freezing
         ip = self.query_one("#ollama_ip", Input).value.rstrip('/')
         self.poll_models_worker(ip)
 
-    # --- UI Interactions & Bindings ---
+    # --- UI Interactions ---
     def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
-        """Adds a selected file from the tree to the processing queue."""
         filepath = str(event.path)
         if filepath not in self.target_files:
             self.target_files.append(filepath)
-            queue = self.query_one("#queue_view", ListView)
-            queue.append(ListItem(Label(os.path.basename(filepath))))
+            self._refresh_queue_ui_main_thread()
             self.write_main_log(f"Queued: {os.path.basename(filepath)}")
 
     def action_clear_queue(self) -> None:
-        """Clears the file queue when 'c' is pressed."""
         self.target_files.clear()
-        self.query_one("#queue_view", ListView).clear()
+        self._refresh_queue_ui_main_thread()
         self.write_main_log("[yellow]Queue cleared.[/yellow]")
 
     def action_poll_models(self) -> None:
-        """Triggered by pressing 'p'. Manually initiates a model poll."""
         ip = self.query_one("#ollama_ip", Input).value.rstrip('/')
         self.write_main_log(f"Initiating manual poll for {ip}...")
         self.poll_models_worker(ip)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Routes button clicks to their respective async background workers."""
+        """
+        CRITICAL FIX: We MUST harvest the state of the checkboxes and inputs on the main UI thread 
+        before sending the data into the background worker. Threaded UI queries fail silently.
+        """
         if event.button.id == "btn_start":
-            self.execute_pipeline_batch()
+            config = {
+                "ip": self.query_one("#ollama_ip", Input).value.rstrip('/'),
+                "model": self.query_one("#model_select", Select).value,
+                "run_ffmpeg": self.query_one("#chk_ffmpeg", Checkbox).value,
+                "run_whisper": self.query_one("#chk_whisper", Checkbox).value,
+                "run_translate": self.query_one("#chk_translate", Checkbox).value,
+                "run_rebalance": self.query_one("#chk_rebalance", Checkbox).value,
+                "run_clean": self.query_one("#chk_cleanup", Checkbox).value,
+            }
+            self.execute_pipeline_batch(config)
+            
         elif event.button.id == "btn_patch":
-            self.execute_patcher_batch()
+            ip = self.query_one("#ollama_ip", Input).value.rstrip('/')
+            model = self.query_one("#model_select", Select).value
+            self.execute_patcher_batch(ip, model)
+
+    # --- UI Updates ---
+    def _refresh_queue_ui_main_thread(self) -> None:
+        queue = self.query_one("#queue_view", ListView)
+        queue.clear()
+        for f in self.target_files:
+            queue.append(ListItem(Label(os.path.basename(f))))
 
     # --- Background Workers ---
-    # The @work decorator sends these functions to a background thread.
-    # Textual strictly forbids updating the UI directly from a background thread, 
-    # so we must use `self.call_from_thread()` to send data back to the main UI.
     @work(thread=True)
     def poll_models_worker(self, ip: str) -> None:
-        """The background worker that safely talks to Ollama without freezing the UI."""
         try:
             response = requests.get(f"{ip}/api/tags", timeout=5)
             response.raise_for_status()
             models = [m['name'] for m in response.json().get('models', [])]
-            # Send the data back to the main thread to update the Dropdown
             self.call_from_thread(self._update_model_select, models)
             self.write_thread_log(f"[green]Success. Found {len(models)} models.[/green]")
         except Exception as e:
             self.write_thread_log(f"[red]Error reaching Ollama: {e}[/red]")
 
     def _update_model_select(self, models: list) -> None:
-        """Updates the Model Dropdown (Must be run on the main thread)."""
         select = self.query_one("#model_select", Select)
         if models:
             select.set_options([(m, m) for m in models])
@@ -186,35 +184,29 @@ class ShowaSync(App):
         else:
             select.set_options([("No models found", "None")])
 
-    # --- Thread-Safe Logging & Telemetry ---
+    # --- Logging & Telemetry ---
     def write_main_log(self, message: str) -> None:
-        """Logs text to the console directly from the MAIN UI thread."""
         self.query_one("#console", RichLog).write(message)
 
     def write_thread_log(self, message: str) -> None:
-        """Logs text to the console safely from a BACKGROUND worker thread."""
         self.call_from_thread(self.query_one("#console", RichLog).write, message)
 
     def update_telemetry(self, current: int, total: int, start_time: float) -> None:
-        """Calculates ETA and Speed, then requests a UI update."""
         if current == 0: return
         elapsed = time.time() - start_time
         avg_time = elapsed / current
         eta = int((total - current) * avg_time)
         speed = 60.0 / avg_time if avg_time > 0 else 0
         pct = (current / total) * 100
-        
         status_text = f"Status: Processing... | Speed: {speed:.1f} batches/min | ETA: {timedelta(seconds=eta)}"
         self.call_from_thread(self._set_progress, pct, status_text)
 
     def _set_progress(self, pct: float, text: str) -> None:
-        """Updates the progress bar (Must be run on the main thread)."""
         self.query_one("#progress_bar", ProgressBar).progress = pct
         self.query_one("#telemetry_label", Label).update(text)
 
-    # --- Data Parsing & Text Manipulation ---
+    # --- Data Parsing ---
     def get_base_prompt(self) -> str:
-        """Constructs the system prompt based on the user's selected profile."""
         profile_key = self.query_one("#profile_select", Select).value
         context = self.profiles.get(profile_key, "")
         return f"""{context}
@@ -224,37 +216,27 @@ CRITICAL LAWS OF RE-FORMATTING:
 3. Return ONLY the finished SRT block output. Do not include markdown blocks or notes."""
 
     def parse_srt_blocks(self, file_path: str) -> dict:
-        """Parses an SRT file into a dictionary mapped by its integer index."""
         if not os.path.exists(file_path): return {}
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read().strip()
-        # Split by double newline to separate subtitle blocks
         blocks = re.split(r'\n\s*\n', content)
         parsed = {}
         for b in blocks:
-            # Extract the leading integer index
             match = re.match(r'^(\d+)\n', b)
             if match: parsed[int(match.group(1))] = b
         return parsed
 
     def time_to_ms(self, t_str: str) -> int:
-        """Converts SRT timestamp format (HH:MM:SS,MMM) to pure milliseconds for math operations."""
         h, m, s, ms = map(int, re.split('[:,]', t_str))
         return (h * 3600000) + (m * 60000) + (s * 1000) + ms
 
     def ms_to_time(self, ms: int) -> str:
-        """Converts pure milliseconds back into the SRT timestamp format."""
         td = timedelta(milliseconds=ms)
         h, rem = divmod(int(td.total_seconds()), 3600)
         m, s = divmod(rem, 60)
         return f"{h:02}:{m:02}:{s:02},{ms % 1000:03}"
 
     def rebalance_srt_file(self, input_srt: str) -> None:
-        """
-        Scans a translated SRT file for lines that are too long (often caused by VAD failures).
-        Mathematically splits the text near the center punctuation, calculates a proportional 
-        time ratio based on string length, and cascades the new timestamps.
-        """
         self.write_thread_log(f"Rebalancing {os.path.basename(input_srt)}...")
         blocks = self.parse_srt_blocks(input_srt)
         new_blocks, new_index = [], 1
@@ -267,14 +249,12 @@ CRITICAL LAWS OF RE-FORMATTING:
             time_line = lines[1]
             clean_text = "\n".join(lines[2:]).replace('\n', ' ').strip()
             
-            # Target threshold for splitting (85 chars is approx 2 full cinematic lines)
             if len(clean_text) > 85:
                 t_match = re.search(r'(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})', time_line)
                 if t_match:
                     start_ms, end_ms = self.time_to_ms(t_match.group(1)), self.time_to_ms(t_match.group(2))
                     dur = end_ms - start_ms
                     
-                    # Search for safe punctuation near the center to split on
                     mid = len(clean_text) // 2
                     split_idx = mid
                     for i in range(mid, len(clean_text)):
@@ -283,8 +263,6 @@ CRITICAL LAWS OF RE-FORMATTING:
                             break
                             
                     part1, part2 = clean_text[:split_idx].strip(), clean_text[split_idx:].strip()
-                    
-                    # Calculate new timestamps based on string length ratio to preserve reading speed
                     ratio = len(part1) / len(clean_text) if len(clean_text) > 0 else 0.5
                     mid_time = int(start_ms + (dur * ratio))
                     
@@ -293,7 +271,6 @@ CRITICAL LAWS OF RE-FORMATTING:
                     new_index += 2
                     continue
             
-            # If no split was needed, just preserve the block and update the index
             new_blocks.append(f"{new_index}\n{time_line}\n{chr(10).join(lines[2:])}")
             new_index += 1
 
@@ -302,130 +279,140 @@ CRITICAL LAWS OF RE-FORMATTING:
             f.write("\n\n".join(new_blocks))
         self.write_thread_log(f"Rebalanced file saved: {os.path.basename(out_file)}")
 
-
-    # --- Primary Execution Engine ---
-
+    # --- Primary Execution Engines ---
     @work(thread=True)
-    def execute_pipeline_batch(self) -> None:
-        """The main chronological pipeline for Audio Extraction -> Transcribing -> Translating."""
+    def execute_pipeline_batch(self, config: dict) -> None:
         if not self.target_files:
             self.write_thread_log("[red]ERROR: No files selected in queue.[/red]")
             return
 
-        ip = self.query_one("#ollama_ip", Input).value.rstrip('/')
-        model = self.query_one("#model_select", Select).value
-        run_ffmpeg = self.query_one("#chk_ffmpeg", Checkbox).value
-        run_whisper = self.query_one("#chk_whisper", Checkbox).value
-        run_translate = self.query_one("#chk_translate", Checkbox).value
-        run_rebalance = self.query_one("#chk_rebalance", Checkbox).value
-        run_clean = self.query_one("#chk_cleanup", Checkbox).value
+        queue_snapshot = list(self.target_files)
+        total_files = len(queue_snapshot)
 
-        self.write_thread_log(f"\n[bold magenta]=== INITIATING BATCH PIPELINE ({len(self.target_files)} Files) ===[/bold magenta]")
+        self.write_thread_log(f"\n[bold magenta]=== INITIATING BATCH PIPELINE ({total_files} Files) ===[/bold magenta]")
         
-        for idx, target in enumerate(self.target_files):
+        for idx, original_target in enumerate(queue_snapshot):
+            target = original_target
             file_root, ext = os.path.splitext(target)
-            self.write_thread_log(f"\n[bold cyan]--- PROCESSING [{idx+1}/{len(self.target_files)}]: {os.path.basename(target)} ---[/bold cyan]")
+            target_dir = os.path.dirname(os.path.abspath(target)) or "."
+            pipeline_failed = False
+            
+            self.write_thread_log(f"\n[bold cyan]--- PROCESSING [{idx+1}/{total_files}]: {os.path.basename(target)} ---[/bold cyan]")
             
             wav_out = f"{file_root}_16k_mono.wav"
             
-            # Step 1: Normalize audio for Whisper's neural net requirements
-            if run_ffmpeg and ext.lower() in ['.mkv', '.mp4', '.ts', '.avi', '.mov']:
+            # Step 1: FFmpeg
+            if config["run_ffmpeg"] and ext.lower() in ['.mkv', '.mp4', '.ts', '.avi', '.mov', '.m4v']:
                 self.write_thread_log("Extracting audio via FFmpeg...")
-                subprocess.run(["ffmpeg", "-i", target, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav_out, "-y"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                target = wav_out
-                self.write_thread_log("[green]FFmpeg extraction complete.[/green]")
+                try:
+                    subprocess.run(["ffmpeg", "-i", target, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav_out, "-y"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if os.path.exists(wav_out):
+                        target = wav_out
+                        self.write_thread_log("[green]FFmpeg extraction complete.[/green]")
+                    else:
+                        raise FileNotFoundError("FFmpeg did not output a file.")
+                except Exception as e:
+                    self.write_thread_log(f"[red]FFmpeg Error: {e}[/red]")
+                    pipeline_failed = True
 
-            # Step 2: Generate Japanese SRT Source
-            if run_whisper and target.endswith('.wav'):
+            # Step 2: WhisperX
+            if config["run_whisper"] and target.endswith('.wav') and not pipeline_failed:
                 self.write_thread_log("Running WhisperX (Generating Source SRT)...")
-                subprocess.run(["whisperx", target, "--model", "large-v3", "--language", "ja", "--max_line_width", "40", "--max_line_count", "2", "--compute_type", "float16", "--output_format", "srt"])
-                target = f"{file_root}_16k_mono.srt"
-                self.write_thread_log("[green]WhisperX transcription complete.[/green]")
+                try:
+                    cmd = ["whisperx", target, "--model", "large-v3", "--language", "ja", "--max_line_width", "40", "--max_line_count", "2", "--compute_type", "float16", "--output_format", "srt", "--output_dir", target_dir]
+                    subprocess.run(cmd)
+                    expected_srt = f"{file_root}_16k_mono.srt"
+                    if os.path.exists(expected_srt):
+                        target = expected_srt
+                        self.write_thread_log("[green]WhisperX transcription complete.[/green]")
+                    else:
+                        raise FileNotFoundError("WhisperX did not produce an SRT file.")
+                except Exception as e:
+                    self.write_thread_log(f"[red]WhisperX Error: {e}[/red]")
+                    pipeline_failed = True
 
-            # Step 3: Batch translation to avoid LLM context memory limits
-            if run_translate and target.endswith('.srt'):
+            # Step 3: Translation
+            if config["run_translate"] and target.endswith('.srt') and not pipeline_failed:
                 if not Client:
                     self.write_thread_log("[red]ERROR: 'ollama' package missing.[/red]")
-                    continue
-                
-                ollama_client = Client(host=ip)
-                output_srt = f"{file_root}-translated.srt"
-                self.write_thread_log(f"Starting LLM Translation: {os.path.basename(output_srt)}")
-                
-                blocks = list(self.parse_srt_blocks(target).values())
-                if not blocks: continue
-
-                chunk_size = 20 # <-- THIS VALUE IS KEY FOR BALANCING CONTEXT LIMITS VS SPEED. Adjust as needed based on your model's capabilities. (i.e. make smaller if you find chunks are incomplete)
-                total_batches = (len(blocks) // chunk_size) + (1 if len(blocks) % chunk_size != 0 else 0)
-                
-                self.call_from_thread(self._set_progress, 0, "Status: Warming up LLM... | ETA: Calculating...")
-                start_time = time.time()
-                
-                with open(output_srt, 'w', encoding='utf-8') as f_out:
-                    for i in range(0, len(blocks), chunk_size):
-                        batch_num = (i // chunk_size) + 1
-                        batch_text = "\n\n".join(blocks[i:i + chunk_size])
-                        self.write_thread_log(f"Sending Batch {batch_num}/{total_batches} to LLM...")
+                    pipeline_failed = True
+                else:
+                    ollama_client = Client(host=config["ip"])
+                    output_srt = f"{file_root}-translated.srt"
+                    self.write_thread_log(f"Starting LLM Translation: {os.path.basename(output_srt)}")
+                    
+                    blocks = list(self.parse_srt_blocks(target).values())
+                    if not blocks:
+                        self.write_thread_log("[red]ERROR: No subtitles found in SRT.[/red]")
+                        pipeline_failed = True
+                    else:
+                        chunk_size = 20
+                        total_batches = (len(blocks) // chunk_size) + (1 if len(blocks) % chunk_size != 0 else 0)
                         
-                        try:
-                            response = ollama_client.chat(
-                                model=model,
-                                messages=[
-                                    {"role": "system", "content": self.get_base_prompt()},
-                                    {"role": "user", "content": f"<subtitles>\n{batch_text}\n</subtitles>"}
-                                ],
-                                options={"temperature": 0.2, "num_ctx": 16384, "num_predict": -1}
-                            )
-                            # Sanitize output by stripping potential Markdown formatting added by the model
-                            clean_out = response['message']['content'].replace('```srt','').replace('```','').strip()
-                            f_out.write(clean_out + "\n\n")
-                        except Exception as e:
-                            self.write_thread_log(f"[red]LLM Error on Batch {batch_num}: {e}[/red]")
+                        self.call_from_thread(self._set_progress, 0, "Status: Warming up LLM... | ETA: Calculating...")
+                        start_time = time.time()
                         
-                        self.update_telemetry(batch_num, total_batches, start_time)
+                        with open(output_srt, 'w', encoding='utf-8') as f_out:
+                            for i in range(0, len(blocks), chunk_size):
+                                batch_num = (i // chunk_size) + 1
+                                batch_text = "\n\n".join(blocks[i:i + chunk_size])
+                                self.write_thread_log(f"Sending Batch {batch_num}/{total_batches} to LLM...")
+                                
+                                try:
+                                    response = ollama_client.chat(
+                                        model=config["model"],
+                                        messages=[
+                                            {"role": "system", "content": self.get_base_prompt()},
+                                            {"role": "user", "content": f"<subtitles>\n{batch_text}\n</subtitles>"}
+                                        ],
+                                        options={"temperature": 0.2, "num_ctx": 16384, "num_predict": -1}
+                                    )
+                                    clean_out = response['message']['content'].replace('```srt','').replace('```','').strip()
+                                    f_out.write(clean_out + "\n\n")
+                                except Exception as e:
+                                    self.write_thread_log(f"[red]LLM Error on Batch {batch_num}: {e}[/red]")
+                                
+                                self.update_telemetry(batch_num, total_batches, start_time)
 
-                self.call_from_thread(self._set_progress, 100, "Status: Translation Complete | Speed: 0 | ETA: 00:00:00")
-                target = output_srt
+                        self.call_from_thread(self._set_progress, 100, "Status: Translation Complete | Speed: 0 | ETA: 00:00:00")
+                        target = output_srt
 
-            # Step 4: Rebalance massive walls of text
-            if run_rebalance and target.endswith('.srt'):
+            # Step 4: Rebalance
+            if config["run_rebalance"] and target.endswith('.srt') and not pipeline_failed:
                 self.rebalance_srt_file(target)
 
-            # Step 5: Clean up large temp audio and leftover Whisper logs
-            if run_clean:
+            # Step 5: Cleanup
+            if config["run_clean"]:
                 self.write_thread_log("Cleaning up temp files...")
                 if os.path.exists(wav_out): os.remove(wav_out)
                 for ext_to_del in ['.json', '.vtt', '.txt', '.tsv']:
                     junk = f"{file_root}_16k_mono{ext_to_del}"
                     if os.path.exists(junk): os.remove(junk)
 
+            # Safely Pop completed file off queue regardless of success/fail status
+            if original_target in self.target_files:
+                self.target_files.remove(original_target)
+                self.call_from_thread(self._refresh_queue_ui_main_thread)
+
         self.write_thread_log("\n[bold magenta]=== ALL PIPELINE TASKS COMPLETE ===[/bold magenta]")
 
     @work(thread=True)
-    def execute_patcher_batch(self) -> None:
-        """
-        The Dynamic Patcher. 
-        Compares the translated output against the Japanese source. If the LLM dropped an index, 
-        it builds a contextual sandbox using the surrounding english lines, translates just the missing 
-        Japanese line, and surgically re-inserts it into the array to restore file integrity.
-        """
+    def execute_patcher_batch(self, ip: str, model: str) -> None:
         if not self.target_files:
             self.write_thread_log("[red]ERROR: No files selected.[/red]")
             return
 
-        ip = self.query_one("#ollama_ip", Input).value.rstrip('/')
-        model = self.query_one("#model_select", Select).value
+        queue_snapshot = list(self.target_files)
 
-        for target in self.target_files:
+        for original_target in queue_snapshot:
+            target = original_target
             if not target.endswith('.srt'): continue
             
-            # Auto-locate the paired translation file
             if not target.endswith('-translated.srt'):
                 trans_file = target.replace('.srt', '-translated.srt')
                 if not os.path.exists(trans_file): continue
                 target = trans_file
 
-            # Auto-locate the paired Japanese source file
             file_root = target.replace('-translated.srt', '')
             source_jp = f"{file_root}_16k_mono.srt"
             if not os.path.exists(source_jp):
@@ -435,54 +422,55 @@ CRITICAL LAWS OF RE-FORMATTING:
             self.write_thread_log(f"\n[bold yellow]=== INITIATING SURGICAL PATCHER: {os.path.basename(target)} ===[/bold yellow]")
             jp_blocks = self.parse_srt_blocks(source_jp)
             eng_blocks = self.parse_srt_blocks(target)
-
-            # Find integer IDs that exist in the Japanese source but are missing in the English output            
+            
             missing_indices = sorted(list(set(jp_blocks.keys()) - set(eng_blocks.keys())))
             
             if not missing_indices:
                 self.write_thread_log("[green]Verification passed. No missing indices found.[/green]")
-                continue
+            else:
+                total = len(missing_indices)
+                self.write_thread_log(f"[yellow]Found {total} missing blocks. Commencing targeted patching...[/yellow]")
+                ollama_client = Client(host=ip)
                 
-            total = len(missing_indices)
-            self.write_thread_log(f"[yellow]Found {total} missing blocks. Commencing targeted patching...[/yellow]")
-            ollama_client = Client(host=ip)
-            
-            self.call_from_thread(self._set_progress, 0, "Status: Patching gaps... | ETA: Calculating...")
-            start_time = time.time()
-            
-            for i, missing_idx in enumerate(missing_indices):
-                current_num = i + 1
-                self.write_thread_log(f"Patching Gap Index #{missing_idx} ({current_num}/{total})...")
+                self.call_from_thread(self._set_progress, 0, "Status: Patching gaps... | ETA: Calculating...")
+                start_time = time.time()
                 
-                jp_text = jp_blocks[missing_idx]
-                prev_ctx = eng_blocks.get(missing_idx - 1, "None")
-                next_ctx = eng_blocks.get(missing_idx + 1, "None")
-                
-                patch_prompt = f"""{self.get_base_prompt()}
+                for i, missing_idx in enumerate(missing_indices):
+                    current_num = i + 1
+                    self.write_thread_log(f"Patching Gap Index #{missing_idx} ({current_num}/{total})...")
+                    
+                    jp_text = jp_blocks[missing_idx]
+                    prev_ctx = eng_blocks.get(missing_idx - 1, "None")
+                    next_ctx = eng_blocks.get(missing_idx + 1, "None")
+                    
+                    patch_prompt = f"""{self.get_base_prompt()}
 You are fixing a missing line in an established sequence.
 === PREVIOUS CONTEXT ===\n{prev_ctx}
 === NEXT CONTEXT ===\n{next_ctx}
 Translate the missing Japanese block so it flows perfectly. Output ONLY the completed SRT block for index {missing_idx}."""
 
-                try:
-                    res = ollama_client.chat(
-                        model=model,
-                        messages=[{"role": "user", "content": patch_prompt + f"\n\n{jp_text}"}],
-                        options={"temperature": 0.2, "num_ctx": 16384}
-                    )
-                    eng_blocks[missing_idx] = res['message']['content'].replace('```srt','').replace('```','').strip()
-                except Exception as e:
-                    self.write_thread_log(f"[red]API Error on index {missing_idx}: {e}[/red]")
-                
-                self.update_telemetry(current_num, total, start_time)
-            
-            # Merge the newly translated blocks and completely rewrite the file
-            with open(target, 'w', encoding='utf-8') as f:
-                for idx in sorted(eng_blocks.keys()):
-                    f.write(eng_blocks[idx] + "\n\n")
+                    try:
+                        res = ollama_client.chat(
+                            model=model,
+                            messages=[{"role": "user", "content": patch_prompt + f"\n\n{jp_text}"}],
+                            options={"temperature": 0.2, "num_ctx": 16384}
+                        )
+                        eng_blocks[missing_idx] = res['message']['content'].replace('```srt','').replace('```','').strip()
+                    except Exception as e:
+                        self.write_thread_log(f"[red]API Error on index {missing_idx}: {e}[/red]")
                     
-            self.call_from_thread(self._set_progress, 100, "Status: Patching Complete | Speed: 0 | ETA: 00:00:00")
-            self.write_thread_log(f"[green]Patching complete for {os.path.basename(target)}.[/green]")
+                    self.update_telemetry(current_num, total, start_time)
+                
+                with open(target, 'w', encoding='utf-8') as f:
+                    for idx in sorted(eng_blocks.keys()):
+                        f.write(eng_blocks[idx] + "\n\n")
+                        
+                self.call_from_thread(self._set_progress, 100, "Status: Patching Complete | Speed: 0 | ETA: 00:00:00")
+                self.write_thread_log(f"[green]Patching complete for {os.path.basename(target)}.[/green]")
+            
+            if original_target in self.target_files:
+                self.target_files.remove(original_target)
+                self.call_from_thread(self._refresh_queue_ui_main_thread)
 
 if __name__ == "__main__":
     app = ShowaSync()
