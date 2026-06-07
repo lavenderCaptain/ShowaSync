@@ -47,6 +47,8 @@ class ShowaSync(App):
     .file_browser_container { height: 15; layout: horizontal; margin-bottom: 1;}
     .checkbox_col { width: 1fr; height: auto; border: round $primary; padding: 1; margin-right: 1;}
     .action_row { height: auto; margin-top: 1; margin-bottom: 1; layout: horizontal; align: center middle;}
+    .queue_buttons { height: auto; layout: horizontal; margin-bottom: 1; align: left middle; }
+    .smart_queue_buttons { height: auto; layout: horizontal; margin-bottom: 1; align: left middle; }
     
     #ollama_ip { width: 35; }
     #model_select { width: 35; }
@@ -87,7 +89,19 @@ class ShowaSync(App):
                 yield Select([("Waiting for poll...", "Waiting...")], id="model_select")
                 yield Select([(k, k) for k in self.profiles.keys()], value="Generic / Catch-all", id="profile_select")
             
-            yield Label("Select files using arrow keys + Enter (Press 'c' to clear queue):", id="file_instruction")
+            # --- Dedicated Type Queues ---
+            with Horizontal(classes="queue_buttons"):
+                yield Button("QUEUE ALL VIDEOS", id="btn_queue_videos", variant="primary")
+                yield Button("QUEUE ALL SRTs", id="btn_queue_srts", variant="primary")
+                yield Button("CLEAR QUEUE", id="btn_clear_queue", variant="error")
+                
+            # --- Smart Queues ---
+            with Horizontal(classes="smart_queue_buttons"):
+                yield Button("Smart: Videos w/o SRTs", id="btn_smart_vids", variant="default")
+                yield Button("Smart: Untranslated SRTs", id="btn_smart_srts", variant="default")
+                yield Button("Smart: Needs Re-balancing", id="btn_smart_rebalance", variant="default")
+                yield Label("  (Or select individually below)", id="file_instruction")
+            
             with Horizontal(classes="file_browser_container"):
                 yield FilteredDirectoryTree(Path("."), id="tree_view")
                 yield ListView(id="queue_view")
@@ -117,6 +131,17 @@ class ShowaSync(App):
         ip = self.query_one("#ollama_ip", Input).value.rstrip('/')
         self.poll_models_worker(ip)
 
+    # --- Naming Normalization ---
+    def _get_base_filename(self, filepath: str) -> str:
+        """
+        Strips extensions and pipeline suffixes (_16k_mono, -translated, -balanced) 
+        to find the true root name of the media file.
+        """
+        filename = os.path.basename(filepath)
+        root, _ = os.path.splitext(filename)
+        root = root.replace('_16k_mono', '').replace('-translated', '').replace('-balanced', '')
+        return root
+
     # --- UI Interactions ---
     def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
         filepath = str(event.path)
@@ -126,9 +151,85 @@ class ShowaSync(App):
             self.write_main_log(f"Queued: {os.path.basename(filepath)}")
 
     def action_clear_queue(self) -> None:
+        """Triggered by the 'c' hotkey or the clear button."""
         self.target_files.clear()
         self._refresh_queue_ui_main_thread()
         self.write_main_log("[yellow]Queue cleared.[/yellow]")
+
+    def action_queue_type(self, file_type: str) -> None:
+        """Scans the current directory for specific file types and queues them."""
+        if file_type == "video":
+            valid_extensions = {".mp4", ".mkv", ".ts", ".avi", ".mov", ".m4v"}
+        else: # srt
+            valid_extensions = {".srt"}
+
+        added_count = 0
+        for path in Path(".").iterdir():
+            if path.is_file() and path.suffix.lower() in valid_extensions:
+                if file_type == "srt" and (path.name.endswith('-translated.srt') or path.name.endswith('-balanced.srt')):
+                    continue
+                filepath = str(path.resolve())
+                if filepath not in self.target_files:
+                    self.target_files.append(filepath)
+                    added_count += 1
+        
+        if added_count > 0:
+            self._refresh_queue_ui_main_thread()
+            type_name = "videos" if file_type == "video" else "SRTs"
+            self.write_main_log(f"[green]Successfully queued {added_count} {type_name}.[/green]")
+        else:
+            self.write_main_log(f"[yellow]No new valid {file_type} files found in the current directory.[/yellow]")
+
+    def action_smart_queue(self, mode: str) -> None:
+        """Handles intelligent queueing based on filesystem state."""
+        added_count = 0
+        vid_extensions = {".mp4", ".mkv", ".ts", ".avi", ".mov", ".m4v"}
+        
+        for path in Path(".").iterdir():
+            if not path.is_file(): continue
+            
+            filepath = str(path.resolve())
+            dir_path = os.path.dirname(filepath)
+            base_name = self._get_base_filename(filepath)
+            
+            # Mode 1: Videos that have no matching SRT whatsoever
+            if mode == "vids_no_srt" and path.suffix.lower() in vid_extensions:
+                has_srt = os.path.exists(os.path.join(dir_path, f"{base_name}.srt")) or \
+                          os.path.exists(os.path.join(dir_path, f"{base_name}_16k_mono.srt"))
+                if not has_srt and filepath not in self.target_files:
+                    self.target_files.append(filepath)
+                    added_count += 1
+
+            # Mode 2: Source SRTs that haven't been translated yet
+            elif mode == "untra_srt" and path.suffix.lower() == ".srt":
+                # Only check source files, ignore output files
+                if not path.name.endswith('-translated.srt') and not path.name.endswith('-balanced.srt'):
+                    has_trans = os.path.exists(os.path.join(dir_path, f"{base_name}-translated.srt"))
+                    if not has_trans and filepath not in self.target_files:
+                        self.target_files.append(filepath)
+                        added_count += 1
+
+            # Mode 3: Translated files that are newer than their balanced counterparts
+            elif mode == "needs_rebalance" and path.name.endswith('-translated.srt'):
+                bal_path = os.path.join(dir_path, f"{base_name}-balanced.srt")
+                needs_balance = False
+                
+                if not os.path.exists(bal_path):
+                    needs_balance = True
+                else:
+                    # Compare timestamps. If trans file was modified more recently (e.g. patched), it needs rebalancing
+                    if os.path.getmtime(filepath) > os.path.getmtime(bal_path):
+                        needs_balance = True
+                        
+                if needs_balance and filepath not in self.target_files:
+                    self.target_files.append(filepath)
+                    added_count += 1
+
+        if added_count > 0:
+            self._refresh_queue_ui_main_thread()
+            self.write_main_log(f"[green]Smart Queue: Added {added_count} files.[/green]")
+        else:
+            self.write_main_log(f"[yellow]Smart Queue: No files found matching criteria '{mode}'.[/yellow]")
 
     def action_poll_models(self) -> None:
         ip = self.query_one("#ollama_ip", Input).value.rstrip('/')
@@ -136,11 +237,22 @@ class ShowaSync(App):
         self.poll_models_worker(ip)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        """
-        CRITICAL FIX: We MUST harvest the state of the checkboxes and inputs on the main UI thread 
-        before sending the data into the background worker. Threaded UI queries fail silently.
-        """
-        if event.button.id == "btn_start":
+        """Routes button clicks."""
+        btn_id = event.button.id
+        if btn_id == "btn_queue_videos":
+            self.action_queue_type("video")
+        elif btn_id == "btn_queue_srts":
+            self.action_queue_type("srt")
+        elif btn_id == "btn_clear_queue":
+            self.action_clear_queue()
+        elif btn_id == "btn_smart_vids":
+            self.action_smart_queue("vids_no_srt")
+        elif btn_id == "btn_smart_srts":
+            self.action_smart_queue("untra_srt")
+        elif btn_id == "btn_smart_rebalance":
+            self.action_smart_queue("needs_rebalance")
+            
+        elif btn_id == "btn_start":
             config = {
                 "ip": self.query_one("#ollama_ip", Input).value.rstrip('/'),
                 "model": self.query_one("#model_select", Select).value,
@@ -152,7 +264,7 @@ class ShowaSync(App):
             }
             self.execute_pipeline_batch(config)
             
-        elif event.button.id == "btn_patch":
+        elif btn_id == "btn_patch":
             ip = self.query_one("#ollama_ip", Input).value.rstrip('/')
             model = self.query_one("#model_select", Select).value
             self.execute_patcher_batch(ip, model)
@@ -293,16 +405,17 @@ CRITICAL LAWS OF RE-FORMATTING:
         
         for idx, original_target in enumerate(queue_snapshot):
             target = original_target
-            file_root, ext = os.path.splitext(target)
+            file_ext = os.path.splitext(target)[1]
             target_dir = os.path.dirname(os.path.abspath(target)) or "."
+            base_name = self._get_base_filename(target)
             pipeline_failed = False
             
             self.write_thread_log(f"\n[bold cyan]--- PROCESSING [{idx+1}/{total_files}]: {os.path.basename(target)} ---[/bold cyan]")
             
-            wav_out = f"{file_root}_16k_mono.wav"
+            wav_out = os.path.join(target_dir, f"{base_name}_16k_mono.wav")
             
             # Step 1: FFmpeg
-            if config["run_ffmpeg"] and ext.lower() in ['.mkv', '.mp4', '.ts', '.avi', '.mov', '.m4v']:
+            if config["run_ffmpeg"] and file_ext.lower() in ['.mkv', '.mp4', '.ts', '.avi', '.mov', '.m4v']:
                 self.write_thread_log("Extracting audio via FFmpeg...")
                 try:
                     subprocess.run(["ffmpeg", "-i", target, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav_out, "-y"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -321,7 +434,7 @@ CRITICAL LAWS OF RE-FORMATTING:
                 try:
                     cmd = ["whisperx", target, "--model", "large-v3", "--language", "ja", "--max_line_width", "40", "--max_line_count", "2", "--compute_type", "float16", "--output_format", "srt", "--output_dir", target_dir]
                     subprocess.run(cmd)
-                    expected_srt = f"{file_root}_16k_mono.srt"
+                    expected_srt = os.path.join(target_dir, f"{base_name}_16k_mono.srt")
                     if os.path.exists(expected_srt):
                         target = expected_srt
                         self.write_thread_log("[green]WhisperX transcription complete.[/green]")
@@ -338,7 +451,7 @@ CRITICAL LAWS OF RE-FORMATTING:
                     pipeline_failed = True
                 else:
                     ollama_client = Client(host=config["ip"])
-                    output_srt = f"{file_root}-translated.srt"
+                    output_srt = os.path.join(target_dir, f"{base_name}-translated.srt")
                     self.write_thread_log(f"Starting LLM Translation: {os.path.basename(output_srt)}")
                     
                     blocks = list(self.parse_srt_blocks(target).values())
@@ -379,6 +492,8 @@ CRITICAL LAWS OF RE-FORMATTING:
 
             # Step 4: Rebalance
             if config["run_rebalance"] and target.endswith('.srt') and not pipeline_failed:
+                # If pipeline just created -translated.srt, we rebalance that.
+                # If pipeline skipped translate but we passed in an SRT, we rebalance whatever was passed in.
                 self.rebalance_srt_file(target)
 
             # Step 5: Cleanup
@@ -386,7 +501,7 @@ CRITICAL LAWS OF RE-FORMATTING:
                 self.write_thread_log("Cleaning up temp files...")
                 if os.path.exists(wav_out): os.remove(wav_out)
                 for ext_to_del in ['.json', '.vtt', '.txt', '.tsv']:
-                    junk = f"{file_root}_16k_mono{ext_to_del}"
+                    junk = os.path.join(target_dir, f"{base_name}_16k_mono{ext_to_del}")
                     if os.path.exists(junk): os.remove(junk)
 
             # Safely Pop completed file off queue regardless of success/fail status
@@ -403,25 +518,45 @@ CRITICAL LAWS OF RE-FORMATTING:
             return
 
         queue_snapshot = list(self.target_files)
+        self.write_thread_log(f"\n[bold magenta]=== STARTING VERIFY & PATCH ON {len(queue_snapshot)} QUEUED FILES ===[/bold magenta]")
 
         for original_target in queue_snapshot:
             target = original_target
-            if not target.endswith('.srt'): continue
+            target_dir = os.path.dirname(os.path.abspath(target)) or "."
+            base_name = self._get_base_filename(target)
             
-            if not target.endswith('-translated.srt'):
-                trans_file = target.replace('.srt', '-translated.srt')
-                if not os.path.exists(trans_file): continue
-                target = trans_file
-
-            file_root = target.replace('-translated.srt', '')
-            source_jp = f"{file_root}_16k_mono.srt"
+            # Patcher requires an SRT
+            if not target.endswith('.srt'): 
+                self.write_thread_log(f"[dim]Skipping {os.path.basename(target)}: Patcher requires an .srt file.[/dim]")
+                if original_target in self.target_files:
+                    self.target_files.remove(original_target)
+                    self.call_from_thread(self._refresh_queue_ui_main_thread)
+                continue
+            
+            # Identify the translation file to patch
+            trans_file = os.path.join(target_dir, f"{base_name}-translated.srt")
+            if not os.path.exists(trans_file): 
+                self.write_thread_log(f"[dim]Skipping {os.path.basename(target)}: Could not find matching '-translated.srt' file.[/dim]")
+                if original_target in self.target_files:
+                    self.target_files.remove(original_target)
+                    self.call_from_thread(self._refresh_queue_ui_main_thread)
+                continue
+            
+            # Identify the Japanese source file
+            source_jp = os.path.join(target_dir, f"{base_name}_16k_mono.srt")
             if not os.path.exists(source_jp):
-                source_jp = f"{file_root}.srt"
-                if not os.path.exists(source_jp): continue
+                source_jp = os.path.join(target_dir, f"{base_name}.srt")
+                if not os.path.exists(source_jp): 
+                    self.write_thread_log(f"[dim]Skipping {os.path.basename(target)}: Could not find original Japanese source (.srt or _16k_mono.srt).[/dim]")
+                    if original_target in self.target_files:
+                        self.target_files.remove(original_target)
+                        self.call_from_thread(self._refresh_queue_ui_main_thread)
+                    continue
 
-            self.write_thread_log(f"\n[bold yellow]=== INITIATING SURGICAL PATCHER: {os.path.basename(target)} ===[/bold yellow]")
+            # --- Proceed with Patching ---
+            self.write_thread_log(f"\n[bold yellow]=== INITIATING SURGICAL PATCHER: {os.path.basename(trans_file)} ===[/bold yellow]")
             jp_blocks = self.parse_srt_blocks(source_jp)
-            eng_blocks = self.parse_srt_blocks(target)
+            eng_blocks = self.parse_srt_blocks(trans_file)
             
             missing_indices = sorted(list(set(jp_blocks.keys()) - set(eng_blocks.keys())))
             
@@ -461,17 +596,18 @@ Translate the missing Japanese block so it flows perfectly. Output ONLY the comp
                     
                     self.update_telemetry(current_num, total, start_time)
                 
-                with open(target, 'w', encoding='utf-8') as f:
+                with open(trans_file, 'w', encoding='utf-8') as f:
                     for idx in sorted(eng_blocks.keys()):
                         f.write(eng_blocks[idx] + "\n\n")
                         
                 self.call_from_thread(self._set_progress, 100, "Status: Patching Complete | Speed: 0 | ETA: 00:00:00")
-                self.write_thread_log(f"[green]Patching complete for {os.path.basename(target)}.[/green]")
+                self.write_thread_log(f"[green]Patching complete for {os.path.basename(trans_file)}.[/green]")
             
+            # Since this file was fully verified (and patched if needed), safely pop it off the queue
             if original_target in self.target_files:
                 self.target_files.remove(original_target)
                 self.call_from_thread(self._refresh_queue_ui_main_thread)
 
 if __name__ == "__main__":
     app = ShowaSync()
-    app.run()
+    # app.run()
