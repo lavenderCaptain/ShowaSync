@@ -610,4 +610,4 @@ Translate the missing Japanese block so it flows perfectly. Output ONLY the comp
 
 if __name__ == "__main__":
     app = ShowaSync()
-    # app.run()
+    app.run()
