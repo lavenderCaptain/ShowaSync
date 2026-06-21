@@ -37,7 +37,7 @@ This script acts as a conductor for several heavy-duty AI tools. **You must have
 
 1. Clone the repository:
    ```bash
-   git clone [https://github.com/YourUsername/ShowaSync.git](https://github.com/YourUsername/ShowaSync.git)
+   git clone https://github.com/lavenderCaptain/ShowaSync.git 
    cd ShowaSync
 2. Install the required Python UI and API packages:
    ```bash
