@@ -10,10 +10,10 @@ import os
 import sys
 import tempfile
 
-# Add parent directory to path to import ShowaSync3
+# Add parent directory to path to import ShowaSync
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from ShowaSync3 import ShowaSync
+from ShowaSync import ShowaSync
 
 
 def test_long_filename_fix():

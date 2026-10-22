@@ -1,32 +1,24 @@
 """
-ShowaSync - Japanese Media Translation Pipeline
-================================================
+ShowaSync v3 - Japanese Media Translation Pipeline (Simple Browser)
+====================================================================
 
-A Textual TUI application that automates the translation of Japanese video
-subtitles using local AI models via Ollama. The pipeline processes media files
-through multiple stages: audio extraction, speech recognition, translation, and
-subtitle formatting.
+A complete pipeline that takes Japanese video files (.mkv/.mp4/.ts) and produces
+English .srt subtitle files, orchestrated from a responsive Textual TUI. The app
+manages an entire workflow: audio extraction -> transcription -> LLM translation ->
+subtitle rebalancing, with smart queuing utilities to batch-process only what
+needs work.
 
-Architecture Overview
----------------------
-This is a monolithic Python application that orchestrates several external tools:
-1. FFmpeg - Audio extraction and format conversion
-2. WhisperX - Speech-to-text transcription (Japanese)
-3. Ollama - Local LLM inference for translation
-4. Textual - Responsive TUI framework
-
-The application manages state through a queue system and processes files
-sequentially through the pipeline stages, with progress tracking and error
-handling at each step.
-
-Key Design Decisions
---------------------
-- Uses subprocess calls to external tools rather than Python libraries for
-  reliability and version compatibility
-- Thread-safe UI updates via call_from_thread() to prevent crashes when
-  background workers update the interface
-- Config persistence via JSON file in current directory
-- Smart queue modes that automatically detect files needing processing
+Architecture overview:
+- Frontend (TUI): `ShowaSync` class provides the interactive interface where users
+  select files, define context profiles, and initiate batch jobs. It manages overall
+  state (queuing, progress tracking).
+- File browser: Two stacked ListViews -- a folder tree showing parent directories up
+  to root, and current_contents showing files/dirs in the active directory. Both
+  update together whenever `_current_path` changes.
+- Pipeline execution: Sequential subprocess management for external tools (FFmpeg,
+  WhisperX, Ollama). Each stage depends on the previous one succeeding.
+- Config persistence: A single runtime dict `self._config_values` serves as the
+  source of truth, saved to disk via event handlers and on_unmount().
 
 Author: LavenderCaptain
 License: MIT
@@ -34,23 +26,20 @@ License: MIT
 
 import os
 import re
-import glob
 import time
 import json
+import threading
+import shutil
+from pathlib import Path
+from datetime import timedelta
+
 import requests
 import subprocess
-import shutil
-import threading
-from datetime import timedelta, datetime
-from pathlib import Path
-
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, Button, Checkbox, Input, Select, RichLog, ProgressBar, Label, DirectoryTree, ListView, ListItem, Static
+from textual.widgets import Header, Footer, Button, Input, Select, RichLog, ProgressBar, Label, ListView, ListItem, Static
 from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
 from textual import work
 from textual.events import Click, Key
-import sys
 
 try:
     from ollama import Client
@@ -58,220 +47,45 @@ except ImportError:
     Client = None
 
 
-class FilteredDirectoryTree(DirectoryTree):
-    """
-    A Textual DirectoryTree widget with file extension filtering.
-
-    This custom directory tree only displays files with specific extensions
-    (.mp4, .mkv, .ts, etc.) and excludes processed subtitle files. It also
-    adds navigation to parent directories via ".." entries with an up-arrow icon.
-
-    Features:
-        - Parent directory navigation (..) with visual indicator
-        - Breadcrumb path display above the tree
-        - Keyboard support for parent navigation (Enter/Space on ..)
-        - Error handling for inaccessible directories
-        - Highlighted current directory styling
-
-    Attributes:
-        show_root (bool): Whether to display the root directory entry
-    """
-
-    def __init__(self, path: Path, *args, **kwargs):
-        """
-        Initialize FilteredDirectoryTree with custom filtering.
-
-        Args:
-            path (Path): Starting directory path
-            *args, **kwargs: Additional arguments passed to parent DirectoryTree
-        """
-        super().__init__(path, *args, **kwargs)
-        self.show_root = False  # Don't show root entry in tree view
-        self._error_log_callback = None  # Set by app to log errors
-
-    def set_error_callback(self, callback):
-        """Set callback for logging errors (e.g., self.write_main_log)."""
-        self._error_log_callback = callback
-
-    def _show_error(self, message: str) -> None:
-        """Log an error message via the registered callback."""
-        if self._error_log_callback:
-            try:
-                self._error_log_callback(f"[red]{message}[/red]")
-            except Exception:
-                pass
-
-    def filter_paths(self, paths: list[Path]) -> list[Path]:
-        """
-        Filter directory entries to only show valid media and subtitle files.
-
-        This method is called by Textual when displaying directory contents.
-        It filters out files with unsupported extensions and processed
-        subtitle files (those ending in '-translated.srt' or '-balanced.srt').
-        It also adds a parent directory entry (..) with an up-arrow icon for
-        navigation.
-
-        Args:
-            paths (list[Path]): List of Path objects to filter
-
-        Returns:
-            list[Path]: Filtered list containing only valid entries
-        """
-        # Valid file extensions for media and subtitles
-        valid_extensions = {".mp4", ".mkv", ".ts", ".avi", ".mov", ".srt", ".m4v"}
-        filtered = []
-
-        # Add parent directory entry if not at root
-        current_dir = getattr(self, 'directory', None)
-        if current_dir:
-            try:
-                abs_curr = Path(current_dir).resolve()
-                abs_parent = abs_curr.parent.resolve()
-                if abs_curr != abs_parent:
-                    filtered.append(abs_parent)
-            except Exception:
-                pass
-
-        for path in paths:
-            if path.is_dir():
-                filtered.append(path)  # Always show directories
-            elif path.suffix.lower() in valid_extensions:
-                # Exclude processed subtitle files to avoid confusion
-                if not path.name.endswith('-translated.srt') and \
-                   not path.name.endswith('-balanced.srt'):
-                    filtered.append(path)
-        return filtered
-
-    def action_directory_selected(self, directory: Path) -> None:
-        """
-        Handle directory selection events with parent navigation support.
-
-        This method overrides the default behavior to handle ".." entries
-        that allow users to navigate up one directory level. When a ".."
-        entry is selected, it loads the parent directory instead of trying
-        to open it as a real directory.
-
-        Args:
-            directory (Path): The selected directory path (may end with "/..")
-        """
-        # Check if this is a parent directory navigation request
-        current_dir = getattr(self, 'directory', None)
-        if current_dir:
-            try:
-                # Detect ".." navigation via multiple methods for cross-platform compatibility
-                dir_str = str(directory)
-                is_parent_nav = (
-                    directory.name == ".." or
-                    dir_str.endswith("/..") or
-                    dir_str.endswith("\\..") or
-                    "/.." in dir_str or
-                    "\\.." in dir_str
-                )
-
-                if is_parent_nav:
-                    parent = Path(current_dir).parent.resolve()
-                    try:
-                        self.load_directory(parent)  # Load parent directory
-                    except PermissionError as e:
-                        self._show_error(f"Cannot access parent directory: {e}")
-                    except OSError as e:
-                        self._show_error(f"Directory access error: {e}")
-                    return  # Don't call super() - we handled it
-            except Exception as e:
-                self._show_error(f"Navigation error: {e}")
-
-        # Call super on older Textual versions that still have it (v0.48 and below)
-        try:
-            super().action_directory_selected(directory)
-        except AttributeError:
-            pass
-
-    def on_key(self, event) -> None:
-        """Handle keyboard events for parent directory navigation."""
-        try:
-            focused_node = self.focused_node
-            if focused_node and focused_node.path and str(focused_node.path).endswith('/..'):
-                current_dir = getattr(self, 'directory', None)
-                if current_dir:
-                    parent = Path(current_dir).parent.resolve()
-                    self.load_directory(parent)
-                    event.stop()  # Prevent default behavior
-                    return
-        except Exception:
-            pass
-
-        # Call super on older Textual versions that still have it (v0.48 and below)
-        try:
-            super().on_key(event)
-        except AttributeError:
-            pass
-
-    def get_directory(self) -> Path | None:
-        """
-        Get the current directory being displayed.
-
-        Returns:
-            Path | None: Current directory path, or None if not set
-        """
-        return getattr(self, 'directory', None)
-
-
 class ShowaSync(App):
-    """
-    Main application class for ShowaSync TUI.
-
-    This is the core orchestrator that manages:
-    - File queue state and UI updates
-    - Configuration persistence (Ollama URL, selected model, profile)
-    - Pipeline execution (FFmpeg -> WhisperX -> Ollama translation)
-    - Smart queue modes for automatic file discovery
-
-    The application runs on Textual framework and uses threading for
-    background processing to keep the UI responsive.
-
-    State Management:
-        target_files (list[str]): Queue of files to process
-        _config_values (dict): Runtime config values synced to disk
-        config (dict): Loaded configuration from JSON file
-    """
-
     TITLE = "ShowaSync"
 
-    # CSS styles for the TUI layout
     CSS = """
     Screen { background: $surface; }
 
-    /* Main content - split between file browser and right panel */
     #main_content {
         height: 1fr;
         layout: horizontal;
     }
 
-    /* Left side: Browser column with breadcrumb on top */
+    /* Left side: file browser (two panes stacked) */
     #browser_column {
         width: 35%;
         height: 100%;
         layout: vertical;
+        border-left: solid $accent;
         border-right: solid $accent;
+        padding: 0 1;
     }
 
-    #breadcrumb {
-        height: 3;
-        padding: 1;
-        text-style: bold;
-        color: $primary;
-        border-bottom: solid $secondary;
-        align: left middle;
-    }
-
-    /* Left: File browser (fixed width) */
-    #tree_view {
+    /* Top pane: folder tree */
+    #folder_tree {
         width: 100%;
-        border: solid $accent;
+        height: 45%;
         overflow-y: scroll;
+        border-bottom: double $accent;
+        padding: 0 1;
     }
 
-    /* Right panel - stack queue, telemetry, and console vertically */
+    /* Bottom pane: current folder contents */
+    #current_contents {
+        width: 100%;
+        height: 55%;
+        overflow-y: scroll;
+        padding: 0 1;
+    }
+
+    /* Right panel */
     #right_panel {
         width: 65%;
         height: 100%;
@@ -279,7 +93,6 @@ class ShowaSync(App):
         border-left: solid $primary;
     }
 
-    /* Queue section */
     #queue_section {
         height: 8;
         overflow-y: scroll;
@@ -292,18 +105,13 @@ class ShowaSync(App):
         margin-bottom: 0;
     }
 
-    /* Telemetry bar - compact status display */
     .telemetry_bar {
         height: 3;
         layout: horizontal;
         margin-top: 1;
     }
 
-    #progress_bar {
-        width: 70%;
-        height: 1;
-    }
-
+    #progress_bar { width: 70%; height: 1; }
     .status_text {
         width: 30%;
         text-align: right;
@@ -311,7 +119,6 @@ class ShowaSync(App):
         text-style: bold;
     }
 
-    /* Console - takes remaining space */
     #console {
         height: 1fr;
         overflow-y: scroll;
@@ -319,26 +126,16 @@ class ShowaSync(App):
         background: $panel;
     }
 
-    /* Config section - minimal, compact */
     .config_section {
         height: auto;
         layout: horizontal;
-        padding: 0;
+        padding: 0 1;
         margin-bottom: 1;
     }
 
-    .config_label {
-        width: 25%;
-        align: right middle;
-        margin-right: 1;
-    }
+    .config_label { width: 25%; align: right middle; margin-right: 1; }
+    .config_input, .config_model, .config_select { width: 25%; min-width: 30; }
 
-    .config_input, .config_model, .config_select {
-        width: 25%;
-        min-width: 30;
-    }
-
-    /* Action bar - bottom row */
     .action_bar {
         height: auto;
         layout: horizontal;
@@ -346,24 +143,11 @@ class ShowaSync(App):
         border-top: solid $surface-lighten-1;
     }
 
-    .spacer {
-        width: 1fr;
-    }
-
+    .spacer { width: 1fr; }
     Button { margin: 0 1; }
-
-    /* Hidden buttons for palette/keyboard shortcuts */
-    .hidden_button {
-        display: none;
-    }
-
-    #queue_view {
-        height: 100%;
-        overflow-y: scroll;
-    }
+    #queue_view { height: 100%; overflow-y: scroll; }
     """
 
-    # Keyboard bindings for quick access to common actions
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("p", "poll_models", "Poll Ollama"),
@@ -378,23 +162,43 @@ class ShowaSync(App):
     ]
 
     def __init__(self):
-        """
-        Initialize ShowaSync application.
-
-        Sets up initial state, loads configuration from disk, and
-        defines available translation profiles with their system prompts.
-        """
         super().__init__()
-        self.target_files = []  # Queue of files to process
-        self._config_values = {}  # Runtime config values synced to disk
+        # target_files is the user's queue of media/SRT files to process.
+        # It holds absolute paths (resolved via _current_path.rglob) so that
+        # execute_pipeline_batch and execute_patcher_batch can use them directly.
+        # Protected by self._queue_lock for thread safety -- background workers
+        # and the main UI thread both read/write this list concurrently.
+        self.target_files = []
+        self._queue_lock = threading.Lock()
 
-        # Config file path - saved in current directory
-        self.config_file = Path("showasync_config.json")
+        # Mapping from original long filenames to safe short filenames (when truncation was needed).
+        # Keys are the original base names, values are dicts with 'translated' and 'balanced' paths.
+        # This allows downstream code to find files even when they were renamed for path length safety.
+        self._filename_mapping = {}
 
-        # Load config if exists (returns empty dict on failure)
-        self.config = self._load_config()
+        # Runtime config dict -- the single source of truth for all settings. Populated
+        # by event handlers (on_input_changed, on_select_changed, on_list_view_item_selected)
+        # and _handle_folder_click whenever a relevant value changes. Saved to disk
+        # via _save_config() in those same handlers AND in on_unmount().
+        self._config_values = {}
 
-        # Translation profiles with contextual prompts for different content types
+        # Path to the persistent config file (JSON). Stored in the user's home
+        # directory (~/.showasync/config.json) so it's independent of CWD and
+        # avoids permission errors when the app is launched from a read-only
+        # directory (e.g., a mounted Windows drive via WSL).
+        self.config_dir = Path.home() / ".showasync"
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        self.config_file = self.config_dir / "config.json"
+
+        # Load previously saved config so settings persist across restarts.
+        loaded = self._load_config()
+        if loaded:
+            self._config_values.update(loaded)
+
+        # Context profiles for LLM prompting. Each key is a display name shown in
+        # the profile_select UI; each value is the system prompt prefix sent to
+        # Ollama before translating subtitles. Users pick one to influence how the
+        # LLM handles genre-specific translation quirks (slang, formality levels, etc.).
         self.profiles = {
             "Generic / Catch-all": "You are an expert Japanese-to-English subtitle translator. Translate the text naturally and professionally.",
             "Variety Show (Chaos)": "You are translating a Japanese variety show. Expect heavy slang, constant overlapping dialogue, and distinct visual on-screen text. Prioritize clarity and character separation.",
@@ -404,96 +208,141 @@ class ShowaSync(App):
             "1980s Yamadamura Comedy": "Context: A 1980s Japanese comedy. Characters speak in an exaggerated rural dialect ending in 'pya'. Translate this into a comedic, exaggerated 'country' English dialect."
         }
 
+    # --- Config Persistence ---
+
     def _load_config(self) -> dict:
-        """
-        Load saved configuration from JSON file.
+        """Load saved config from disk.
 
-        Attempts to read the config file and parse it as JSON. Returns
-        empty dictionary on any error (file not found, corrupt JSON, etc.)
-        to ensure graceful degradation.
+        Returns a dict of key-value pairs previously written by _save_config().
+        If the file doesn't exist (first launch) or is corrupt, returns an empty
+        dict so the app falls back to defaults without crashing.
 
-        Returns:
-            dict: Loaded configuration values, or empty dict if loading fails
+        Why we return {} instead of raising: callers (compose(), on_mount()) need
+        safe fallback behavior -- they read keys with .get() and default values,
+        so an empty dict means "use built-in defaults" rather than a crash.
         """
         if self.config_file.exists():
             try:
                 with open(self.config_file, "r") as f:
                     return json.load(f)
             except (json.JSONDecodeError, IOError):
-                return {}  # Return empty config on any error
+                # File exists but is malformed or unreadable -- treat as no saved config.
+                return {}
         return {}
 
     def _save_config(self) -> None:
-        """
-        Save current configuration to JSON file.
+        """Persist _config_values to disk as JSON.
 
-        Writes the runtime config values (_config_values dict) to disk
-        as formatted JSON. Errors are silently ignored to prevent crashes
-        during normal operation.
+        Called from event handlers (on_input_changed, on_select_changed, etc.)
+        whenever a relevant setting changes, AND from on_unmount() as a safety net
+        for any values not yet saved. This ensures settings survive app restarts.
+
+        Filters out non-serializable values (like Textual's NoSelection sentinel)
+        before writing -- these can leak in from Select widget defaults and would
+        otherwise cause TypeError on exit. IOError is logged rather than swallowed
+        so users know if their settings can't be persisted (disk full, etc.).
         """
         try:
-            # Write the stored config values to disk
+            # Filter out values that can't be JSON serialized (Textual NoSelection sentinels, etc.)
+            serializable = {}
+            for k, v in self._config_values.items():
+                try:
+                    json.dumps(v)  # Test if value is serializable
+                    serializable[k] = v
+                except (TypeError, ValueError):
+                    pass  # Skip non-serializable values silently
+
             with open(self.config_file, "w") as f:
-                json.dump(self._config_values, f, indent=2)
-        except IOError:
-            pass  # Silently ignore write errors
+                json.dump(serializable, f, indent=2)
+        except IOError as e:
+            self.write_thread_log(f"[yellow]Warning: Could not save config: {e}[/yellow]")
+
+    def _set_and_save_config(self, key: str, value) -> None:
+        """Update a config value and persist it to disk immediately.
+
+        Convenience helper that replaces the repeated pattern of setting a key in
+        _config_values followed by calling _save_config(). Ensures consistency and
+        prevents accidentally saving stale or missing values.
+
+        Skips the save if the value is the "Waiting..." placeholder, because that
+        is a transient UI state and persisting it would overwrite any previously
+        saved model preference on the next app launch.
+
+        Args:
+            key: Config dict key (e.g., "ollama_ip", "profile").
+            value: New string value to store.
+        """
+        # Guard: never persist the "Waiting..." placeholder to disk.
+        # If the model_select widget fires on_select_changed before Ollama
+        # responds, we'd otherwise save the placeholder and overwrite any
+        # previously saved model preference.
+        if key == "model" and value == "Waiting...":
+            self._config_values[key] = value
+            return
+        self._config_values[key] = value
+        self._save_config()
+        # Debug log -- confirms the save actually reached disk. If this doesn't
+        # show up, _save_config is silently failing (IOError path) and we need
+        # to investigate that separately.
+        if key == "model":
+            saved = json.loads(self.config_file.read_text())
+            self.write_main_log(f"[dim]config save: model={saved.get('model')!r}[/dim]")
 
     def compose(self) -> ComposeResult:
-        """
-        Build the TUI layout by yielding widget hierarchy.
+        """Build the TUI layout.
 
-        This method is called by Textual to construct the interface. It
-        creates a two-panel layout with file browser on left and queue/
-        config/console on right, plus action buttons at bottom.
+        The interface is split into three vertical zones:
+        1. Header -- always visible, shows app title and clock
+        2. Main content area (Horizontal container):
+           - Left column (35% width): File browser with two stacked ListViews
+             * folder_tree: Shows parent directory hierarchy up to root
+             * current_contents: Shows files/dirs in the active directory
+           - Right panel (65% width): Queue, config inputs, console output
+        3. Footer -- always visible, shows keyboard shortcut hints
 
-        Returns:
-            ComposeResult: Iterator of widgets defining the UI structure
+        Config values are read from _config_values for initial UI state. This dict
+        is kept in sync with disk via event handlers and on_unmount().
         """
         yield Header(show_clock=True)
 
-        # Get saved config values or use defaults
-        saved_ollama = self.config.get("ollama_ip", "http://127.0.0.1:11434")
-        saved_profile = self.config.get("profile", "Generic / Catch-all")
-        saved_dir = self.config.get("last_directory", None)
-
-        # Determine starting directory (use saved if valid, otherwise CWD)
-        if saved_dir and Path(saved_dir).is_dir():
-            start_dir = Path(saved_dir).resolve()
-        else:
-            start_dir = Path.cwd().resolve()
+        # Read saved config values for UI initialization. These come from
+        # _config_values which was populated by the sync step in __init__ if a
+        # previous config file existed. After init, all reads go through this
+        # dict which is kept in sync via event handlers.
+        saved_ollama = self._config_values.get("ollama_ip", "http://127.0.0.1:11434")
+        saved_profile = self._config_values.get("profile", "Generic / Catch-all")
+        saved_model = self._config_values.get("model", "")
 
         with Horizontal(id="main_content"):
-            # Left side: File browser with breadcrumb and tree
+            # Left side: file browser (two panes stacked vertically)
             with Vertical(id="browser_column"):
-                yield Static("Current Directory", id="breadcrumb")
-                tree = FilteredDirectoryTree(start_dir, id="tree_view")
-                tree.set_error_callback(self.write_main_log)
-                yield tree
+                yield Static("Current Folder", id="breadcrumb")
+                yield ListView(id="folder_tree")
+                yield ListView(id="current_contents")
 
-            # Right side: Queue, Config, Console (stacked)
+            # Right side: queue list, progress telemetry, console log
             with Vertical(id="right_panel"):
-                # Queue display
                 with Vertical(id="queue_section"):
                     yield Label("Queued Files", classes="panel_title")
                     yield ListView(id="queue_view")
 
-                # Telemetry bar - shows current progress during jobs
                 with Horizontal(classes="telemetry_bar"):
                     yield ProgressBar(total=100, show_eta=True, id="progress_bar")
                     yield Static("Status: Idle | Step: --", id="status_label", classes="status_text")
 
-                # Console/Log at the bottom (larger)
                 yield RichLog(id="console", highlight=True, markup=True)
 
-        # Config section - separate row (minimal)
+        # Config row: Ollama URL input, model selector (populated async), profile selector
         with Horizontal(classes="config_section"):
             yield Static("Ollama URL:", classes="config_label")
             yield Input(value=saved_ollama.rstrip("/"), id="ollama_ip", placeholder="http://127.0.0.1:11434", classes="config_input")
-            # Always start with "Waiting..." - will be populated when Ollama is polled
+            # Note: model_select is initialized with "Waiting..." placeholder.
+            # _update_model_select() (called after Ollama responds) will set the actual selection
+            # from saved config or default to first available model.
             yield Select([("Waiting...", "Waiting...")], value="Waiting...", id="model_select", classes="config_model")
             yield Select([(k, k) for k in self.profiles.keys()], value=saved_profile, id="profile_select", classes="config_select")
 
-        # Bottom action bar
+        # Action bar: queuing controls | smart queue shortcuts | pipeline execution
         with Horizontal(classes="action_bar"):
             yield Button("Queue Videos", id="btn_queue_videos", variant="primary")
             yield Button("Queue SRTs", id="btn_queue_srts", variant="primary")
@@ -510,171 +359,395 @@ class ShowaSync(App):
 
         yield Footer()
 
-    def on_mount(self) -> None:
-        """
-        Initialize app after UI is mounted.
+    def on_unmount(self) -> None:
+        # Save settings on exit. NOTE: we deliberately do NOT save the model here.
+        # The model is already persisted by on_select_changed (user picks a model)
+        # and by _update_model_select (restoring from saved config). Saving it here
+        # would overwrite the saved value with whatever the widget currently shows,
+        # which is models[0] (e.g. "deepseek") if the background poll hasn't
+        # finished yet or if the saved model isn't in the available list.
+        try:
+            ollama_ip = self.query_one("#ollama_ip", Input).value.rstrip('/')
+            profile = self.query_one("#profile_select", Select).value
+            self._set_and_save_config("ollama_ip", ollama_ip)
+            self._set_and_save_config("profile", profile)
+        except Exception as e:
+            # If widgets aren't ready (shouldn't happen, but defensive), skip silently.
+            pass
 
-        Sets up breadcrumb updates when directory tree changes, checks for
-        required external tools (FFmpeg, WhisperX, Ollama SDK), and starts
-        background polling of Ollama to populate model list.
+        # Final save and log what's on disk for debugging.
+        self._save_config()
+        try:
+            raw = json.loads(self.config_file.read_text())
+            self.write_main_log(f"[dim]on_unmount config keys: {list(raw.keys())}[/dim]")
+        except Exception:
+            pass
+
+    # --- Helpers (extracted from duplicated patterns) ---
+
+    def _is_widget_in_folder_tree(self, widget) -> bool:
+        """Check if a widget is a descendant of the folder_tree ListView.
+
+        Walks up the parent chain looking for an ancestor with id="folder_tree".
+        Used to distinguish clicks/selections on the folder tree (parent dir hierarchy)
+        from those on current_contents (files in active directory).
+
+        Args:
+            widget: The widget to check -- typically a ListItem or its child.
+
+        Returns:
+            True if widget is inside folder_tree, False otherwise.
         """
-        self.write_main_log("ShowaSync loaded. Checking prerequisites...")
+        current = getattr(widget, 'parent', None)
+        while current:
+            if hasattr(current, 'id') and current.id == "folder_tree":
+                return True
+            current = getattr(current, 'parent', None)
+        return False
+
+    def _remove_from_queue(self, filepath: str) -> None:
+        """Remove a file from the queue and refresh the UI.
+
+        Thread-safe helper that replaces the repeated pattern of checking membership,
+        removing the item, and refreshing the queue ListView. Used in multiple places
+        (button handlers, keyboard handler, pipeline batch methods).
+
+        The UI refresh is marshaled to the main thread via call_from_thread because
+        this method can be called from background worker threads where Textual widgets
+        are not accessible (would raise LookupError on active_app ContextVar).
+
+        Args:
+            filepath: Absolute path to remove from self.target_files.
+        """
+        with self._queue_lock:
+            if filepath in self.target_files:
+                self.target_files.remove(filepath)
+        # Marshal UI refresh to main thread -- this method is called from background
+        # workers where direct widget access would crash (LookupError on active_app).
+        self.call_from_thread(self._refresh_queue_ui_main_thread)
+
+    def _validate_ollama_url(self, url: str) -> bool:
+        """Validate that an Ollama URL has a proper scheme (http:// or https://).
+
+        Prevents confusing connection errors downstream by catching malformed URLs
+        early and logging a clear message. Returns True if valid, False otherwise.
+
+        Args:
+            url: User-provided Ollama base URL.
+
+        Returns:
+            True if the URL has http(s) scheme, False otherwise.
+        """
+        return url.startswith("http://") or url.startswith("https://")
+
+    # --- Folder Browser Logic ---
+
+    def _init_folder_browser(self, start_dir: Path) -> None:
+        """Initialize folder tree and current contents for a starting directory."""
+        self._current_path = start_dir.resolve()
+        self._refresh_folder_tree()
+        self._refresh_current_contents()
+
+    def _refresh_folder_tree(self) -> None:
+        """Refresh the folder tree ListView showing parent directories up to root."""
+        folder_tree = self.query_one("#folder_tree", ListView)
+        folder_tree.clear()
+
+        if not hasattr(self, '_current_path'):
+            return
+
+        # Show ".." at top for navigation up (with icon)
+        if self._current_path != self._current_path.parent:
+            item = ListItem(Label("[dim]📂[/dim] .. (parent)"))
+            item.data = "PARENT"  # type: ignore[attr-defined]
+            folder_tree.append(item)
+
+        # Show current path hierarchy with tree-style icons and connectors
+        try:
+            parts = list(self._current_path.parts)
+            for i in range(1, len(parts)):
+                partial = Path(*parts[:i+1])
+                if partial.is_dir():
+                    name = parts[i]
+                    # Build prefix: folder icon + tree connectors based on depth
+                    is_last = (i == len(parts) - 1)
+                    connector = "└──" if is_last else "├──"
+
+                    # Add vertical bars for intermediate levels
+                    prefix_parts = []
+                    for j in range(1, i):
+                        prefix_parts.append("│   ")
+                    prefix_parts.append(f"{connector} 📁")
+
+                    prefix = "".join(prefix_parts)
+                    item = ListItem(Label(f"{prefix}[bold]{name}[/bold]"))
+                    item.data = str(partial)  # type: ignore[attr-defined]
+                    folder_tree.append(item)
+        except Exception:
+            pass
+
+    def _refresh_current_contents(self) -> None:
+        """Refresh the current contents ListView showing files/dirs in current_path."""
+        if not hasattr(self, '_current_path'):
+            return
+
+        contents = self.query_one("#current_contents", ListView)
+        contents.clear()
+
+        valid_ext = {".mp4", ".mkv", ".ts", ".avi", ".mov", ".srt", ".m4v"}
+        excluded = ("-translated.srt", "-balanced.srt")
+
+        try:
+            for item in sorted(self._current_path.iterdir()):
+                entry = None  # Reset for each iteration
+
+                if item.is_dir():
+                    label = f"[bold]📁 {item.name}[/bold]"
+                    entry = ListItem(Label(label))
+                    entry.data = str(item)  # type: ignore[attr-defined]
+                elif item.is_file() and item.suffix.lower() in valid_ext:
+                    if not any(item.name.endswith(s) for s in excluded):
+                        label = f"├── {item.name}"
+                        entry = ListItem(Label(label))
+                        entry.data = str(item.resolve())  # type: ignore[attr-defined]
+
+                if entry is not None:
+                    contents.append(entry)
+        except Exception as e:
+            self.write_main_log(f"[red]Error loading folder: {e}[/red]")
+
+    def _handle_folder_click(self, event) -> None:
+        """Handle clicks on folder tree or contents list items.
+
+        This is the central dispatch for all left-panel navigation. It determines
+        which ListView was clicked (folder_tree vs current_contents), interprets
+        the stored data accordingly, and updates state + views.
+
+        Why we distinguish the two ListViews: both are children of browser_column,
+        so Textual's on_click fires for clicks in either one. We walk up from the
+        clicked widget to check which ListView owns it -- folder_tree items represent
+        path hierarchy levels (parent dirs), while current_contents items represent
+        files/dirs in the active directory. The same click handler must behave
+        differently for each: clicking a parent dir in folder_tree navigates UP,
+        while clicking a subfolder in current_contents navigates INTO it.
+
+        Important: we only process ListItem children of folder_tree or current_contents.
+        Clicks on other widgets inside browser_column (e.g., Select dropdowns) are
+        ignored to avoid corrupting Textual's internal event routing -- see issue where
+        clicking the profile/model selects caused a NoneType crash in _forward_event.
+        """
+        widget = event.widget
+
+        # Walk up from the clicked widget to find its owning ListItem.
+        # Textual events fire on the innermost widget (e.g., a Static label),
+        # not the container, so we need to climb the parent chain first.
+        while widget and not isinstance(widget, ListItem):
+            widget = widget.parent
+        if not widget:
+            return
+
+        data = getattr(widget, "data", None)
+        if not data:
+            return
+
+        # Determine which ListView was clicked using the shared helper.
+        is_in_folder_tree = self._is_widget_in_folder_tree(widget)
+
+        # --- Navigation logic ---
+        if data == "PARENT":
+            # Clicked the ".. (parent)" entry in folder_tree -- go up one level.
+            self._current_path = self._current_path.parent.resolve()
+        elif Path(data).is_dir():
+            # It's a directory. Update _current_path to point at it so subsequent
+            # operations (like Smart queue) scan from the correct location.
+            self._current_path = Path(data).resolve()
+
+            if is_in_folder_tree:
+                # Clicked a parent dir in folder_tree -- refresh both views to show
+                # the selected path's contents without navigating into it.
+                self._refresh_folder_tree()
+                self._refresh_current_contents()
+            else:
+                # Clicked a subfolder in current_contents -- navigate INTO it by
+                # updating _current_path and refreshing views to show its children.
+                # This is critical for Smart queue operations: without this, _current_path
+                # stays at the parent directory, so rglob scans from the wrong base path
+                # and misses files in subdirectories you just clicked into.
+                self._refresh_folder_tree()
+                self._refresh_current_contents()
+
+        # Persist last directory so we can restore it on next launch via config.
+        self._set_and_save_config("last_directory", str(self._current_path))
+
+        if Path(data).is_file():
+            filepath = str(Path(data))
+            with self._queue_lock:
+                if filepath not in self.target_files:
+                    self.target_files.append(filepath)
+            self._refresh_queue_ui_main_thread()
+            self.write_main_log(f"Queued: {os.path.basename(filepath)}")
+
+        # Refresh both views after any folder/file click to keep them in sync.
+        if is_in_folder_tree or Path(data).is_dir():
+            self._refresh_folder_tree()
+            self._refresh_current_contents()
+
+    def on_click(self, event) -> None:
+        """Route clicks to folder browser handler if they hit the left panel."""
+        widget = event.widget
+        # Check if click is in the browser column
+        current = getattr(widget, 'parent', None)
+        while current:
+            if hasattr(current, 'id') and current.id == "browser_column":
+                self._handle_folder_click(event)
+                return
+            current = getattr(current, 'parent', None)
+
+    def on_mount(self) -> None:
+        self.write_main_log("ShowaSync v3 loaded. Checking prerequisites...")
         missing_tools = self._check_prerequisites()
         if missing_tools:
             self.write_main_log(f"[yellow]Warning: Missing tools: {', '.join(missing_tools)}[/yellow]")
+
+        # Initialize folder browser with current directory
+        saved_dir = self._config_values.get("last_directory", None)
+        start_dir = Path(saved_dir).resolve() if saved_dir and Path(saved_dir).is_dir() else Path.cwd().resolve()
+        self._init_folder_browser(start_dir)
+
         self.write_main_log("Polling Ollama in the background...")
         ip = self.query_one("#ollama_ip", Input).value.rstrip('/')
         self.poll_models_worker(ip)
 
-        # Set initial breadcrumb to current tree directory
-        self._update_breadcrumb()
+    # --- File Browser Logic ---
 
-    def on_directory_tree_directory_selected(self, message) -> None:
-        """Handle directory selection events from the tree widget."""
-        self._update_breadcrumb()
-
-    def _update_breadcrumb(self) -> None:
-        """Update the breadcrumb display with current tree directory."""
-        try:
-            tree = self.query_one("#tree_view", FilteredDirectoryTree)
-            current_dir = tree.get_directory()
-            if current_dir:
-                breadcrumb = self.query_one("#breadcrumb", Static)
-                # Show relative path from home or full path for short paths
-                path_str = str(current_dir)
-                try:
-                    home = Path.home()
-                    rel = path_str.replace(str(home), "~")
-                    if len(rel) < 60:
-                        path_str = rel
-                except Exception:
-                    pass
-                breadcrumb.update(f"[bold]Current:[/bold] {path_str}")
-        except Exception:
-            pass
-
-    def on_unmount(self) -> None:
-        """Skip config saving during unmount - widgets are being torn down."""
-        pass
-
-    def _check_prerequisites(self) -> list[str]:
-        """
-        Check if required external tools are installed.
-
-        Verifies that FFmpeg, WhisperX CLI, and Ollama Python SDK are
-        available. Returns list of missing tool names for error reporting.
-
-        Returns:
-            list[str]: Names of missing required tools
-        """
-        missing = []
-        for cmd in ["ffmpeg", "whisperx"]:
-            if shutil.which(cmd) is None:
-                missing.append(cmd)
-        if Client is None:
-            missing.append("ollama package (pip install ollama)")
-        return missing
-
-    def _get_base_filename(self, filepath: str) -> str:
-        """
-        Extract base filename without processing suffixes.
-
-        Removes common suffixes added by pipeline stages (_16k_mono,
-        -translated, -balanced) to get the original media filename.
-
-        Args:
-            filepath (str): Full path to file
-
-        Returns:
-            str: Base filename with processing suffixes removed
-        """
-        filename = os.path.basename(filepath)
-        root, _ = os.path.splitext(filename)
-        # Remove common pipeline suffixes
-        root = root.replace('_16k_mono', '').replace('-translated', '').replace('-balanced', '')
-        return root
-
-    # --- UI Interactions ---
-
-    def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
-        """
-        Handle file selection from directory tree.
-
-        When a user clicks on a media file in the browser, add it to
-        the processing queue if not already present.
-
-        Args:
-            event (DirectoryTree.FileSelected): Event containing selected path
-        """
-        filepath = str(event.path)
-        if filepath not in self.target_files:
-            self.target_files.append(filepath)
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        btn_id = event.button.id
+        if btn_id == "btn_queue_videos":
+            self.action_queue_type("video")
+        elif btn_id == "btn_queue_srts":
+            self.action_queue_type("srt")
+        elif btn_id == "btn_clear_queue":
+            self.action_clear_queue()
+        elif btn_id == "btn_remove_selected":
+            with self._queue_lock:
+                if not self.target_files:
+                    return
+                filepath = self.target_files[0]
+                filename = os.path.basename(filepath)
+                self.target_files.pop(0)
             self._refresh_queue_ui_main_thread()
-            self.write_main_log(f"Queued: {os.path.basename(filepath)}")
+            self.write_main_log(f"[dim]Removed: {filename}[/dim]")
+        elif btn_id == "btn_smart_vids":
+            self.action_smart_queue("vids_no_srt")
+        elif btn_id == "btn_smart_srts":
+            self.action_smart_queue("untra_srt")
+        elif btn_id == "btn_smart_rebalance":
+            self.action_smart_queue("needs_rebalance")
+        elif btn_id == "btn_start":
+            ip = self.query_one("#ollama_ip", Input).value.rstrip('/')
+            model = self.query_one("#model_select", Select).value
 
-    def on_directory_tree_directory_selected(self, event: DirectoryTree.DirectorySelected) -> None:
+            # Validate Ollama URL before starting the pipeline.
+            if not self._validate_ollama_url(ip):
+                self.write_main_log(f"[red]ERROR: Invalid Ollama URL: {ip}[/red]")
+                return
+
+            config = {
+                "ip": ip,
+                "model": model,
+                "run_ffmpeg": True,
+                "run_whisper": True,
+                "run_translate": True,
+                "run_rebalance": True,
+                "run_clean": True,
+            }
+            self.execute_pipeline_batch(config)
+        elif btn_id == "btn_patch":
+            ip = self.query_one("#ollama_ip", Input).value.rstrip('/')
+            model = self.query_one("#model_select", Select).value
+
+            # Validate Ollama URL before starting the patcher.
+            if not self._validate_ollama_url(ip):
+                self.write_main_log(f"[red]ERROR: Invalid Ollama URL: {ip}[/red]")
+                return
+
+            self._set_and_save_config("ollama_ip", ip)
+            self._set_and_save_config("model", model)
+            self.execute_patcher_batch(ip, model)
+
+    def on_list_view_item_selected(self, event) -> None:
+        """Handle item selection from browser list (keyboard Enter/Space)."""
+        item = event.item
+        data = getattr(item, "data", None)
+        if not data or data == "PARENT":
+            return
+
+        # Determine which ListView triggered the selection using shared helper.
+        is_in_folder_tree = self._is_widget_in_folder_tree(event.widget)
+
+        # Handle folder navigation (only from current_contents via keyboard)
+        if Path(data).is_dir():
+            self._current_path = Path(data).resolve()
+            self._set_and_save_config("last_directory", str(self._current_path))
+            self._refresh_folder_tree()
+            self._refresh_current_contents()
+            return
+
+        # Handle file selection
+        if not Path(data).is_file():
+            return
+        filepath = str(Path(data))
+        with self._queue_lock:
+            if filepath not in self.target_files:
+                self.target_files.append(filepath)
+        self._refresh_queue_ui_main_thread()
+        self.write_main_log(f"Queued: {os.path.basename(filepath)}")
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Persist Ollama IP whenever it changes."""
+        if event.input.id == "ollama_ip":
+            self._set_and_save_config("ollama_ip", event.value.rstrip('/'))
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        """Persist profile and model whenever they change.
+
+        Skips saving the model when the value is the "Waiting..." placeholder,
+        because that's a transient UI state, not a real user selection. Saving it
+        would overwrite any previously persisted model preference on the next
+        app launch.
         """
-        Handle directory selection from file browser.
-
-        Saves the selected directory path to config for persistence
-        across app restarts.
-
-        Args:
-            event (DirectoryTree.DirectorySelected): Event containing selected path
-        """
-        if hasattr(self, 'config'):
-            self.config["last_directory"] = str(event.path)
-            self._save_config()
+        if event.select.id == "profile_select":
+            self._set_and_save_config("profile", event.value)
+        elif event.select.id == "model_select":
+            if event.value == "Waiting...":
+                return  # Don't persist the placeholder
+            self._set_and_save_config("model", event.value)
 
     def _refresh_queue_ui_main_thread(self) -> None:
-        """
-        Refresh the queue view with current target files.
-
-        Clears the ListView and repopulates it with items from
-        target_files list. Called after any queue modification.
-        """
         queue = self.query_one("#queue_view", ListView)
         queue.clear()
         for f in self.target_files:
             queue.append(ListItem(Label(os.path.basename(f))))
 
     def on_key(self, event: Key) -> None:
-        """
-        Handle keyboard shortcuts.
-
-        Currently supports Delete key to remove first item from queue
-        when focused on the queue view.
-
-        Args:
-            event (Key): Keyboard event with key information
-        """
         if event.key == "delete":
-            # Remove first item from queue when Delete is pressed
-            if self.target_files:
-                filename = os.path.basename(self.target_files[0])
+            with self._queue_lock:
+                if not self.target_files:
+                    return
+                filepath = self.target_files[0]
+                filename = os.path.basename(filepath)
                 self.target_files.pop(0)
-                self._refresh_queue_ui_main_thread()
-                self.write_main_log(f"[dim]Removed: {filename}[/dim]")
-                event.stop()
+            self._refresh_queue_ui_main_thread()
+            self.write_main_log(f"[dim]Removed: {filename}[/dim]")
+            event.stop()
 
     def action_clear_queue(self) -> None:
-        """Clear all items from the processing queue."""
-        self.target_files.clear()
+        with self._queue_lock:
+            self.target_files.clear()
         self._refresh_queue_ui_main_thread()
         self.write_main_log("[yellow]Queue cleared.[/yellow]")
 
     def action_queue_type(self, file_type: str) -> None:
-        """
-        Scan current directory for files of specified type and add to queue.
-
-        Recursively searches from current working directory for media
-        files (.mp4, .mkv, etc.) or SRT files depending on file_type
-        parameter. Skips already-processed files and handles IO errors
-        gracefully.
-
-        Args:
-            file_type (str): "video" for media files, "srt" for subtitles
-        """
         if file_type == "video":
             valid_extensions = {".mp4", ".mkv", ".ts", ".avi", ".mov", ".m4v"}
         else:
@@ -682,22 +755,22 @@ class ShowaSync(App):
 
         added_count = 0
         skipped_count = 0
-        root_dir = Path(".")
+        scan_dir = getattr(self, '_current_path', Path("."))
 
-        # Search recursively through all subdirectories
         try:
-            for path in root_dir.rglob("*"):
+            for path in scan_dir.rglob("*"):
                 try:
                     if not path.is_file():
                         continue
                     if path.suffix.lower() not in valid_extensions:
                         continue
                     if file_type == "srt" and (path.name.endswith('-translated.srt') or path.name.endswith('-balanced.srt')):
-                        continue  # Skip processed files
+                        continue
                     filepath = str(path.resolve())
-                    if filepath not in self.target_files:
-                        self.target_files.append(filepath)
-                        added_count += 1
+                    with self._queue_lock:
+                        if filepath not in self.target_files:
+                            self.target_files.append(filepath)
+                            added_count += 1
                 except (OSError, IOError) as e:
                     skipped_count += 1
                     self.write_main_log(f"[yellow]Skipped {os.path.basename(str(path))}: {e}[/yellow]")
@@ -705,7 +778,16 @@ class ShowaSync(App):
             self.write_main_log(f"[red]Error scanning directories: {e}[/red]")
 
         if added_count > 0:
-            self._refresh_queue_ui_main_thread()
+            with self._queue_lock:
+                snapshot = list(self.target_files)
+            # Refresh UI directly (we're already on the main thread).
+            def _refresh():
+                queue = self.query_one("#queue_view", ListView)
+                queue.clear()
+                for f in self.target_files:
+                    queue.append(ListItem(Label(os.path.basename(f))))
+            _refresh()
+
             type_name = "videos" if file_type == "video" else "SRTs"
             msg = f"[green]Successfully queued {added_count} {type_name}.[/green]"
             if skipped_count > 0:
@@ -715,198 +797,117 @@ class ShowaSync(App):
             self.write_main_log(f"[yellow]No new valid {file_type} files found in the current directory.[/yellow]")
 
     def action_smart_queue(self, mode: str) -> None:
-        """
-        Smart queue mode that auto-detects files needing processing.
-
-        Three modes available:
-        - "vids_no_srt": Videos without corresponding SRT files
-        - "untra_srt": Transcription-only SRTs (no translation yet)
-        - "needs_rebalance": Translated SRTs older than their source
-
-        Args:
-            mode (str): One of "vids_no_srt", "untra_srt", or "needs_rebalance"
-        """
         added_count = 0
         skipped_count = 0
         vid_extensions = {".mp4", ".mkv", ".ts", ".avi", ".mov", ".m4v"}
 
-        # Use rglob for recursive search through all subdirectories
+        scan_dir = getattr(self, '_current_path', Path("."))
+        self.write_main_log(f"[dim]Smart queue '{mode}': scanning from {scan_dir.resolve()}[/dim]")
+
+        # Wrap the entire rglob in a try/except because broken symlinks or unresponsive
+        # mounts ([Errno 5] I/O error) raise OSError during iteration, which the inner
+        # per-file try/except can't catch since it fires before entering the loop body.
         try:
-            for path in Path(".").rglob("*"):
-                try:
-                    if not path.is_file():
-                        continue
-
-                    filepath = str(path.resolve())
-                    dir_path = os.path.dirname(filepath)
-                    base_name = self._get_base_filename(filepath)
-
-                    if mode == "vids_no_srt" and path.suffix.lower() in vid_extensions:
-                        has_srt = os.path.exists(os.path.join(dir_path, f"{base_name}.srt")) or \
-                                  os.path.exists(os.path.join(dir_path, f"{base_name}_16k_mono.srt"))
-                        if not has_srt and filepath not in self.target_files:
-                            self.target_files.append(filepath)
-                            added_count += 1
-
-                    elif mode == "untra_srt" and path.suffix.lower() == ".srt":
-                        if not path.name.endswith('-translated.srt') and not path.name.endswith('-balanced.srt'):
-                            has_trans = os.path.exists(os.path.join(dir_path, f"{base_name}-translated.srt"))
-                            if not has_trans and filepath not in self.target_files:
-                                self.target_files.append(filepath)
-                                added_count += 1
-
-                    elif mode == "needs_rebalance" and path.name.endswith('-translated.srt'):
-                        bal_path = os.path.join(dir_path, f"{base_name}-balanced.srt")
-                        needs_balance = False
-
-                        if not os.path.exists(bal_path):
-                            needs_balance = True
-                        else:
-                            if os.path.getmtime(filepath) > os.path.getmtime(bal_path):
-                                needs_balance = True
-
-                        if needs_balance and filepath not in self.target_files:
-                            self.target_files.append(filepath)
-                            added_count += 1
-                except (OSError, IOError) as e:
-                    skipped_count += 1
-                    # Log individual file errors so user knows what was skipped
-                    self.write_main_log(f"[yellow]Skipped {os.path.basename(filepath)}: {e}[/yellow]")
+            paths = list(scan_dir.rglob("*"))
         except (OSError, IOError) as e:
-            self.write_main_log(f"[red]Error scanning directories: {e}[/red]")
+            self.write_main_log(f"[red]Error scanning directory tree: {e}[/red]")
+            return
 
-        # Summary message showing what happened
+        for path in paths:
+            try:
+                if not path.is_file():
+                    continue
+
+                filepath = str(path.resolve())
+                dir_path = os.path.dirname(filepath)
+                base_name = self._get_base_filename_v3(filepath, is_srt=(path.suffix.lower() == '.srt'))
+
+                if mode == "vids_no_srt" and path.suffix.lower() in vid_extensions:
+                    srt_a = self._find_srt_file_flexible(dir_path, base_name, "")
+                    srt_b = self._find_srt_file_flexible(dir_path, base_name, "_16k_mono")
+                    has_srt_a = srt_a and os.path.exists(srt_a)
+                    has_srt_b = srt_b and os.path.exists(srt_b)
+                    if not (has_srt_a or has_srt_b):
+                        if filepath not in self.target_files:
+                            with self._queue_lock:
+                                self.target_files.append(filepath)
+                            added_count += 1
+                            self.write_main_log(f"[green]+ queued[/green] {os.path.basename(filepath)}")
+                    else:
+                        found = "srt" if has_srt_a else "_16k_mono.srt"
+                        self.write_main_log(f"[dim]- skipped (has SRT)[/dim] {os.path.basename(filepath)} ({found})")
+
+                elif mode == "untra_srt" and path.suffix.lower() == ".srt":
+                    if not path.name.endswith('-translated.srt') and not path.name.endswith('-balanced.srt'):
+                        has_trans = bool(self._find_srt_file_flexible(dir_path, base_name, "-translated"))
+                        if not has_trans and filepath not in self.target_files:
+                            with self._queue_lock:
+                                self.target_files.append(filepath)
+                            added_count += 1
+
+                elif mode == "needs_rebalance" and path.name.endswith('-translated.srt'):
+                    bal_path = self._find_srt_file_flexible(dir_path, base_name, "-balanced")
+                    needs_balance = False
+
+                    if not bal_path or not os.path.exists(bal_path):
+                        needs_balance = True
+                    else:
+                        if os.path.getmtime(filepath) > os.path.getmtime(bal_path):
+                            needs_balance = True
+
+                    if needs_balance and filepath not in self.target_files:
+                        with self._queue_lock:
+                            self.target_files.append(filepath)
+                        added_count += 1
+            except (OSError, IOError) as e:
+                # Per-file error handling -- skip this file and continue scanning.
+                skipped_count += 1
+                self.write_main_log(f"[yellow]Skipped {os.path.basename(str(path))}: {e}[/yellow]")
+
         summary = f"Smart Queue: Added {added_count} files"
         if skipped_count > 0:
             summary += f", Skipped {skipped_count} due to errors"
 
-        self._refresh_queue_ui_main_thread()
+        with self._queue_lock:
+            snapshot = list(self.target_files)
+        # Refresh UI directly (we're already on the main thread).
+        def _refresh():
+            queue = self.query_one("#queue_view", ListView)
+            queue.clear()
+            for f in self.target_files:
+                queue.append(ListItem(Label(os.path.basename(f))))
+        _refresh()
+
         self.write_main_log(f"[green]{summary}.[/green]")
 
     def action_poll_models(self) -> None:
-        """Manually trigger Ollama model polling."""
         ip = self.query_one("#ollama_ip", Input).value.rstrip('/')
         self.write_main_log(f"Initiating manual poll for {ip}...")
         self.poll_models_worker(ip)
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        """
-        Handle button press events.
-
-        Routes button clicks to appropriate action methods based on
-        button ID. Handles queue management, smart queue modes, and
-        pipeline execution.
-
-        Args:
-            event (Button.Pressed): Event containing pressed button info
-        """
-        btn_id = event.button.id
-        if btn_id == "btn_queue_videos":
-            self.action_queue_type("video")
-        elif btn_id == "btn_queue_srts":
-            self.action_queue_type("srt")
-        elif btn_id == "btn_clear_queue":
-            self.action_clear_queue()
-        elif btn_id == "btn_remove_selected":
-            # Remove first item from queue (same as Delete key)
-            if self.target_files:
-                filename = os.path.basename(self.target_files[0])
-                self.target_files.pop(0)
-                self._refresh_queue_ui_main_thread()
-                self.write_main_log(f"[dim]Removed: {filename}[/dim]")
-        elif btn_id == "btn_smart_vids":
-            self.action_smart_queue("vids_no_srt")
-        elif btn_id == "btn_smart_srts":
-            self.action_smart_queue("untra_srt")
-        elif btn_id == "btn_smart_rebalance":
-            self.action_smart_queue("needs_rebalance")
-
-        elif btn_id == "btn_start":
-            config = {
-                "ip": self.query_one("#ollama_ip", Input).value.rstrip('/'),
-                "model": self.query_one("#model_select", Select).value,
-                "run_ffmpeg": True,
-                "run_whisper": True,
-                "run_translate": True,
-                "run_rebalance": True,
-                "run_clean": True,
-            }
-            self.execute_pipeline_batch(config)
-
-        elif btn_id == "btn_patch":
-            ip = self.query_one("#ollama_ip", Input).value.rstrip('/')
-            model = self.query_one("#model_select", Select).value
-            # Store current values for config persistence
-            self._config_values["ollama_ip"] = ip
-            self._config_values["model"] = model
-            self.execute_patcher_batch(ip, model)
-
-    def on_select_changed(self, event: Select.Changed) -> None:
-        """
-        Handle selection changes in dropdown menus.
-
-        Saves profile and model selections to config for persistence
-        across app restarts.
-
-        Args:
-            event (Select.Changed): Event containing changed select widget
-        """
-        # Handle profile changes
-        if event.select.id == "profile_select":
-            self._config_values["profile"] = event.select.value
-            self._save_config()
-            return
-
-        # Handle model selection changes
-        if event.select.id == "model_select":
-            self._config_values["model"] = event.select.value
-            self._save_config()
-            return
-
-        # Handle queue list refresh (from DirectoryTree selection)
-        if event.select.id == "queue_view":
-            return  # This shouldn't happen but just in case
-
-    def on_input_changed(self, event: Input.Changed) -> None:
-        """
-        Save config when Ollama IP input changes.
-
-        Args:
-            event (Input.Changed): Event containing changed input widget
-        """
-        if event.input.id == "ollama_ip":
-            self._config_values["ollama_ip"] = event.value.rstrip("/")
-
     # --- Keyboard shortcut actions ---
 
     def action_queue_videos(self) -> None:
-        """Queue videos via keyboard shortcut (v key)."""
         self.action_queue_type("video")
 
     def action_queue_srts(self) -> None:
-        """Queue SRTs via keyboard shortcut (s key)."""
         self.action_queue_type("srt")
 
     def action_smart_vids(self) -> None:
-        """Smart queue videos without SRTs via keyboard shortcut (n key)."""
         self.action_smart_queue("vids_no_srt")
 
     def action_smart_translate(self) -> None:
-        """Smart queue untranslated SRTs via keyboard shortcut (t key)."""
         self.action_smart_queue("untra_srt")
 
     def action_smart_rebalance(self) -> None:
-        """Smart queue needs-rebalancing files via keyboard shortcut (b key)."""
         self.action_smart_queue("needs_rebalance")
 
     def action_start_pipeline(self) -> None:
-        """Trigger start pipeline button via keyboard shortcut (x key)."""
         btn = self.query_one("#btn_start", Button)
         if btn.visible:
             btn.press()
 
     def action_verify_patch(self) -> None:
-        """Trigger verify & patch button via keyboard shortcut (z key)."""
         btn = self.query_one("#btn_patch", Button)
         if btn.visible:
             btn.press()
@@ -915,96 +916,151 @@ class ShowaSync(App):
 
     @work(thread=True)
     def poll_models_worker(self, ip: str) -> None:
-        """
-        Fetch available models from Ollama API in background thread.
+        """Poll the local Ollama instance to discover available models.
 
-        Queries the Ollama REST API at /api/tags to get list of
-        loaded models. Updates model dropdown on main thread using
-        call_from_thread to prevent UI crashes.
+        Runs in a background thread (via Textual's @work decorator) so it doesn't
+        block the TUI while waiting for network response. The Ollama API endpoint
+        /api/tags returns a JSON list of loaded models -- we extract just the names
+        and update the model_select UI widget on the main thread.
+
+        Why background thread: HTTP requests can hang or timeout; doing this on the
+        main TUI thread would freeze the interface until Ollama responds (or fails).
 
         Args:
-            ip (str): Ollama server IP/URL (e.g., "http://127.0.0.1:11434")
+            ip: Base URL of the Ollama instance (e.g., "http://127.0.0.1:11434").
+                Passed from on_mount() or action_poll_models(). Must include scheme.
+
+        Side effects:
+            - Updates #model_select Select widget with discovered model names
+            - Writes success/error message to console log
+            - If Ollama unreachable, leaves model_select at "Waiting..." state
         """
         try:
             response = requests.get(f"{ip}/api/tags", timeout=5)
             response.raise_for_status()
             models = [m['name'] for m in response.json().get('models', [])]
+
+            # Update UI on main thread -- can't touch Textual widgets from background threads.
             self.call_from_thread(self._update_model_select, models)
             self.write_thread_log(f"[green]Success. Found {len(models)} models.[/green]")
         except Exception as e:
             self.write_thread_log(f"[red]Error reaching Ollama: {e}[/red]")
 
     def _update_model_select(self, models: list) -> None:
-        """
-        Update model dropdown with fetched models.
+        """Populate the model_select UI widget with discovered Ollama models.
 
-        Sets options to available models and selects saved model if
-        still available, otherwise first model in list. This method
-        runs on main thread (called via call_from_thread).
+        Called from poll_models_worker on the main thread (via call_from_thread).
+        If a previously saved model name is still available, restore it as selected;
+        otherwise default to the first model in the list. Saves the selection to
+        _config_values so it persists across app restarts.
+
+        Why we always save explicitly: Textual's on_select_changed event does not
+        reliably fire for programmatic value changes (it depends on whether the new
+        value differs from the current one and on widget state). Since _set_and_save_config
+        is called by that handler too, relying on it alone would miss saves triggered
+        here. So we save directly after every select.value assignment.
 
         Args:
-            models (list): List of model names from Ollama API
+            models: List of model names returned by Ollama /api/tags endpoint.
+                Empty list means no models loaded -- show placeholder option.
         """
         select = self.query_one("#model_select", Select)
         if models:
-            # Set options first (required before setting value)
+            # Build display options from model names (label and value are identical)
             select.set_options([(m, m) for m in models])
-            # Check if saved model is available, otherwise use first
-            saved_model = self.config.get("model") or self._config_values.get("model")
-            if saved_model and saved_model in models:
+
+            # Prefer saved model if it exists; otherwise use first available model.
+            saved_model = self._config_values.get("model")
+            self.write_main_log(f"[dim]Loaded config model: {saved_model!r}[/dim]")
+            self.write_main_log(f"[dim]Ollama models ({len(models)}): {[m for m in models]}[/dim]")
+            # Only use placeholder if there's no saved model at all.
+            # Always preserve the saved model even if Ollama doesn't currently have it loaded.
+            if saved_model and saved_model != "Waiting...":
                 select.value = saved_model
-                self._config_values["model"] = saved_model
+                # Add saved model to options if not already there (might be unloaded from Ollama)
+                if saved_model not in models:
+                    current_options = select.options
+                    select.set_options([(m, m) for m in models] + [(saved_model, saved_model)])
+                self._set_and_save_config("model", saved_model)
+                self.write_main_log(f"[green]Restored model: {saved_model}[/green]")
             else:
                 select.value = models[0]
-                self._config_values["model"] = models[0]
+                self._set_and_save_config("model", models[0])
+                self.write_main_log(f"[dim]No saved model available; using first model: {models[0]}[/dim]")
+        elif self._config_values.get("model"):
+            # Ollama returned no models but we have a saved selection -- offer it
+            # as a selectable option so the user can still pick it. Without this,
+            # the dropdown only shows "No models found" and the saved model is
+            # invisible, so it never gets re-saved on the next launch.
+            saved = self._config_values["model"]
+            select.set_options([(saved, saved), ("No models found", "None")])
+            select.value = saved
+            self._set_and_save_config("model", saved)
+            self.write_main_log(f"[dim]Ollama unavailable; offering saved model: {saved!r}[/dim]")
         else:
+            # No models AND no saved selection -- show placeholder.
+            # (The disk config fallback via self.config was removed -- self.config is
+            # a Textual ConfigManager, not a dict, so .get() doesn't work as intended.)
             select.set_options([("No models found", "None")])
 
     # --- Logging & Telemetry ---
 
     def write_main_log(self, message: str) -> None:
-        """
-        Write message to console widget (main thread only).
+        """Write a message to the console RichLog widget.
 
-        Args:
-            message (str): Message to display in console
+        This is the main-thread logging method. For use from background threads,
+        call write_thread_log() instead -- it will marshal the call to the main thread.
+        During shutdown, the widget may already be torn down -- silently drop in that case.
         """
-        self.query_one("#console", RichLog).write(message)
+        try:
+            self.query_one("#console", RichLog).write(message)
+        except Exception:
+            pass
 
     def write_thread_log(self, message: str) -> None:
-        """
-        Thread-safe log writer.
+        """Thread-safe logging that marshals to main thread if needed.
 
-        Checks if running on main thread and uses appropriate method
-        to avoid crashes from cross-thread UI updates.
+        Textual widgets can only be modified from the main (UI) thread. If this method
+        is called from a background worker thread (like poll_models_worker or pipeline
+        execution), it uses call_from_thread() to safely invoke write_main_log on the
+        main thread. If already on the main thread, calls directly.
+
+        During app shutdown, widgets may already be torn down. In that case, silently
+        drop the message rather than crashing -- the app is exiting anyway.
 
         Args:
-            message (str): Message to display in console
+            message: Log message string (supports Textual markup for styling).
         """
-        if threading.current_thread() == threading.main_thread():
-            self.write_main_log(message)
-        else:
-            self.call_from_thread(self.write_main_log, message)
+        try:
+            if threading.current_thread() == threading.main_thread():
+                self.write_main_log(message)
+            else:
+                self.call_from_thread(self.write_main_log, message)
+        except Exception:
+            # Widgets destroyed during shutdown -- silently drop.
+            pass
 
     def update_telemetry(self, current: int, total: int, start_time: float, step_name: str = "Processing") -> None:
-        """
-        Update progress bar and status text with telemetry data.
+        """Update progress bar and status text with pipeline telemetry.
 
-        Calculates percentage complete, speed, and ETA based on
-        processing metrics. Thread-safe via internal check.
+        Calculates elapsed time, average speed, ETA, and percentage complete based
+        on (current, total) work units and the wall-clock start time. Updates both
+        the ProgressBar widget (#progress_bar) and the status Static widget.
+
+        Thread-safe: marshals widget updates to main thread if called from background.
 
         Args:
-            current (int): Current item number (1-indexed)
-            total (int): Total items in batch
-            start_time (float): Unix timestamp when batch started
-            step_name (str): Name of current pipeline stage
+            current: Number of completed work units (batches processed).
+            total: Total number of work units in this batch.
+            start_time: Wall-clock time when processing began (from time.time()).
+            step_name: Label for the current pipeline stage (e.g., "FFmpeg", "WhisperX").
         """
         if current == 0: return
         elapsed = time.time() - start_time
         avg_time = elapsed / current
         eta = int((total - current) * avg_time)
         speed = 60.0 / avg_time if avg_time > 0 else 0
-        pct = (current / total) * 100 if total > 0 else 0
+        pct = min(100.0, (current / total) * 100) if total > 0 else 0
         status_text = f"Step: {step_name} | Batch: {current}/{total} | Speed: {speed:.1f}/min | ETA: {timedelta(seconds=eta)}"
         if threading.current_thread() == threading.main_thread():
             self._set_progress(pct, status_text)
@@ -1012,29 +1068,23 @@ class ShowaSync(App):
             self.call_from_thread(self._set_progress, pct, status_text)
 
     def _set_progress(self, pct: float, text: str) -> None:
-        """
-        Set progress bar value and status text (main thread only).
-
-        Args:
-            pct (float): Progress percentage (0-100)
-            text (str): Status text to display
-        """
         self.query_one("#progress_bar", ProgressBar).progress = pct
         self.query_one("#status_label", Static).update(text)
 
     # --- Data Parsing & Anchoring ---
 
-    def get_base_prompt(self) -> str:
-        """
-        Get translation prompt based on selected profile.
+    def get_base_prompt(self, profile_key: str) -> str:
+        """Build the system prompt for LLM translation.
 
-        Combines the system context from current profile with
-        formatting instructions for SRT output.
+        Thread-safe version that takes the profile key as an argument instead of
+        querying the widget tree (which would crash from a background thread).
+
+        Args:
+            profile_key: The display name of the selected context profile.
 
         Returns:
-            str: Complete prompt string for LLM
+            System prompt string combining the profile context with formatting rules.
         """
-        profile_key = self.query_one("#profile_select", Select).value
         context = self.profiles.get(profile_key, "")
         return f"""{context}
 CRITICAL LAWS OF RE-FORMATTING:
@@ -1042,19 +1092,15 @@ CRITICAL LAWS OF RE-FORMATTING:
 2. Split continuous walls of text into new lines when the speaker changes. Start new speakers with a hyphen (-).
 3. Return ONLY the finished SRT block output. Do not include markdown blocks or notes."""
 
+    def _get_profile_key(self) -> str:
+        """Get the currently selected profile key from the UI widget tree.
+
+        Must be called on the main thread (or marshaled there via call_from_thread).
+        Returns the value of the #profile_select Select widget.
+        """
+        return self.query_one("#profile_select", Select).value
+
     def parse_srt_blocks(self, file_path: str) -> dict:
-        """
-        Parse SRT file into dictionary of indexed blocks.
-
-        Reads SRT file and splits by double newlines to extract
-        individual subtitle blocks keyed by their index number.
-
-        Args:
-            file_path (str): Path to SRT file
-
-        Returns:
-            dict: Dictionary mapping index numbers to block strings
-        """
         if not os.path.exists(file_path): return {}
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read().strip()
@@ -1066,21 +1112,6 @@ CRITICAL LAWS OF RE-FORMATTING:
         return parsed
 
     def anchor_timestamps(self, raw_llm_text: str, original_jp_blocks: dict) -> str:
-        """
-        Force LLM output to use original Japanese timestamps.
-
-        Intercepts translated text from LLM and replaces any
-        hallucinated timestamps with mathematically correct ones
-        from the source Japanese SRT file. This ensures timing
-        accuracy regardless of what the LLM outputs.
-
-        Args:
-            raw_llm_text (str): Raw output from LLM (may have wrong timestamps)
-            original_jp_blocks (dict): Dictionary of original Japanese blocks with correct times
-
-        Returns:
-            str: Corrected SRT text with proper timestamps
-        """
         llm_blocks = re.split(r'\n\s*\n', raw_llm_text.strip())
         anchored_output = []
 
@@ -1090,16 +1121,11 @@ CRITICAL LAWS OF RE-FORMATTING:
                 try:
                     idx = int(lines[0].strip())
                     if idx in original_jp_blocks:
-                        # Grab the original Japanese block and extract line 2 (the true timestamp)
                         orig_lines = original_jp_blocks[idx].split('\n')
                         true_time = orig_lines[1]
-
-                        # Rebuild the block: [Index] -> [True Time] -> [Translated Text]
                         text = "\n".join(lines[2:])
                         anchored_output.append(f"{idx}\n{true_time}\n{text}")
                     else:
-                        # If LLM hallucinates an index that doesn't exist, we append it as-is
-                        # so we don't lose text, but it's highly unlikely to break chronological order.
                         anchored_output.append(block)
                 except ValueError:
                     anchored_output.append(block)
@@ -1109,47 +1135,25 @@ CRITICAL LAWS OF RE-FORMATTING:
         return "\n\n".join(anchored_output)
 
     def time_to_ms(self, t_str: str) -> int:
-        """
-        Convert SRT timestamp string to milliseconds.
-
-        Parses "HH:MM:SS,mmm" format and returns total milliseconds.
-
-        Args:
-            t_str (str): Timestamp string in SRT format
-
-        Returns:
-            int: Total milliseconds
-        """
         h, m, s, ms = map(int, re.split('[:,]', t_str))
         return (h * 3600000) + (m * 60000) + (s * 1000) + ms
 
     def ms_to_time(self, ms: int) -> str:
-        """
-        Convert milliseconds to SRT timestamp string.
-
-        Args:
-            ms (int): Milliseconds to convert
-
-        Returns:
-            str: Timestamp in "HH:MM:SS,mmm" format
-        """
         td = timedelta(milliseconds=ms)
         h, rem = divmod(int(td.total_seconds()), 3600)
         m, s = divmod(rem, 60)
         return f"{h:02}:{m:02}:{s:02},{ms % 1000:03}"
 
     def rebalance_srt_file(self, input_srt: str) -> None:
-        """
-        Rebalance long subtitle lines into shorter chunks.
-
-        Splits subtitles longer than 85 characters at punctuation
-        boundaries to improve readability. Creates new '-balanced.srt'
-        file with proportional time distribution.
-
-        Args:
-            input_srt (str): Path to input SRT file
-        """
         self.write_thread_log(f"Rebalancing {os.path.basename(input_srt)}...")
+
+        # Guard against processing already-balanced files -- writing output to the
+        # same path would silently overwrite the previous result. Skip with a log
+        # message so users know why no new file was produced.
+        if input_srt.endswith('-balanced.srt'):
+            self.write_thread_log(f"Skipping {os.path.basename(input_srt)}: already balanced.")
+            return
+
         blocks = self.parse_srt_blocks(input_srt)
         new_blocks, new_index = [], 1
 
@@ -1167,7 +1171,6 @@ CRITICAL LAWS OF RE-FORMATTING:
                     start_ms, end_ms = self.time_to_ms(t_match.group(1)), self.time_to_ms(t_match.group(2))
                     dur = end_ms - start_ms
 
-                    # Find split point at punctuation near middle of text
                     mid = len(clean_text) // 2
                     split_idx = mid
                     for i in range(mid, len(clean_text)):
@@ -1187,33 +1190,183 @@ CRITICAL LAWS OF RE-FORMATTING:
             new_blocks.append(f"{new_index}\n{time_line}\n{chr(10).join(lines[2:])}")
             new_index += 1
 
-        out_file = input_srt.replace('.srt', '-balanced.srt')
+        # Extract just the filename, then reassemble path with safe_output_path
+        base_name = os.path.splitext(os.path.basename(input_srt))[0]
+        dir_path = os.path.dirname(input_srt) or "."
+        out_file = self._safe_output_path(dir_path, base_name, "-balanced")
         with open(out_file, 'w', encoding='utf-8') as f:
             f.write("\n\n".join(new_blocks))
         self.write_thread_log(f"Rebalanced file saved: {os.path.basename(out_file)}")
+
+    # --- Filename Helper (v3: handles _16k_mono SRT files correctly) ---
+
+    def _get_base_filename_v3(self, filepath: str, is_srt: bool = False) -> str:
+        """Get the base filename for pipeline operations.
+
+        Strips common pipeline suffixes (_16k_mono, -translated, -balanced) to derive a
+        canonical base name used consistently across all modes. Previously SRT inputs
+        preserved _16k_mono while video inputs stripped it -- this inconsistency caused
+        Smart: No SRT and Smart: Translate to look for filenames like 'foo_16k_mono-translated.srt'
+        that don't exist (the pipeline writes 'foo-translated.srt').
+
+        Args:
+            filepath: Full path to the file.
+            is_srt: Deprecated -- kept for API compatibility but no longer affects logic.
+
+        Returns:
+            Base filename without extension or pipeline-specific suffixes.
+        """
+        filename = os.path.basename(filepath)
+        root, _ = os.path.splitext(filename)
+
+        # Strip all pipeline stage suffixes uniformly so different modes match correctly.
+        root = root.replace('_16k_mono', '').replace('-translated', '').replace('-balanced', '')
+        return root
+
+    def _safe_output_path(self, dir_path: str, long_filename: str, suffix: str = "") -> str:
+        """Generate a safe output path that won't exceed OS path length limits.
+
+        On Windows (and WSL accessing Windows drives), paths are limited to ~260 characters.
+        Japanese filenames can be very long, and adding pipeline suffixes (-translated, -balanced)
+        can push the total path over the limit, causing OSError: [Errno 36] File name too long.
+
+        This helper detects when the output path would be too long and uses a shorter
+        canonical name (truncated base + hash) to stay within limits while maintaining
+        uniqueness.
+
+        Args:
+            dir_path: Directory to write the file in.
+            long_filename: The desired filename (may be too long).
+            suffix: Optional suffix to append before .srt (e.g., "-translated", "-balanced").
+
+        Returns:
+            A safe output path. If the long filename works, returns it unchanged.
+            Otherwise, returns a path with a truncated filename that includes a hash
+            for uniqueness.
+        """
+        # Try the original path first — append suffix + .srt to get the full desired filename
+        safe_filename = f"{long_filename}{suffix}.srt"
+        candidate = os.path.join(dir_path, safe_filename)
+        if len(candidate) <= 260:  # Windows MAX_PATH limit
+            return candidate
+
+        # Path too long -- generate a shorter canonical name
+        # Use a hash of the original filename to ensure uniqueness
+        import hashlib
+        filename_hash = hashlib.md5(long_filename.encode('utf-8')).hexdigest()[:8]
+
+        # Calculate available space for filename
+        # Path = dir_path + "/" + filename
+        dir_path_len = len(dir_path) + 1  # +1 for the "/" separator
+        max_filename_len = 260 - dir_path_len  # Leave some safety margin
+
+        base_name = os.path.splitext(os.path.basename(long_filename))[0]
+
+        # Calculate how much we need to truncate
+        suffix_len = len(suffix) + 5  # +5 for ".srt" extension
+        available = max_filename_len - suffix_len
+
+        if len(base_name) > available:
+            # Truncate base name but keep it readable
+            # Reserve space for "_XXXXXXXX" hash suffix
+            truncated = base_name[:max(10, available - 9)] + f"_{filename_hash}"
+        else:
+            truncated = base_name
+
+        safe_filename = f"{truncated}{suffix}.srt"
+        safe_path = os.path.join(dir_path, safe_filename)
+
+        # Verify the safe path is actually within limits
+        if len(safe_path) > 260:
+            # Emergency truncation - use just the hash
+            safe_filename = f"{filename_hash}{suffix}.srt"
+            safe_path = os.path.join(dir_path, safe_filename)
+            self.write_thread_log(f"[yellow]WARNING: Path still too long, using hash-only name: {safe_filename}[/yellow]")
+
+        # Log the truncation so users know what happened
+        self.write_thread_log(f"[dim]Path truncated for safety: {os.path.basename(long_filename)[:50]}... -> {os.path.basename(safe_path)}[/dim]")
+
+        return safe_path
+
+    def _find_srt_file_flexible(self, dir_path: str, base_name: str, suffix: str) -> str:
+        """Find an SRT file with flexible name matching for path-truncated files.
+
+        When filenames are truncated for path length safety, downstream code needs to
+        find the resulting files. This helper tries multiple name variants:
+        1. Original exact name (works when no truncation occurred)
+        2. Pattern match for files with the exact suffix (for truncated files)
+
+        Args:
+            dir_path: Directory to search in.
+            base_name: The original base filename (may be truncated in some contexts).
+            suffix: File suffix to look for (e.g., "-translated", "_16k_mono", "-balanced").
+
+        Returns:
+            Full path to the found file, or empty string if not found.
+        """
+        # Try exact match first (fast path for non-truncated files)
+        exact_path = os.path.join(dir_path, f"{base_name}{suffix}.srt")
+        if os.path.exists(exact_path):
+            return exact_path
+
+        # For truncated files, look for files with the suffix that share a prefix with base_name.
+        # This avoids matching unrelated files that happen to end with the same suffix.
+        if suffix:
+            import glob
+            # Use base_name as a prefix filter: only match files starting with base_name[:20] + suffix.srt
+            prefix = base_name[:20] if len(base_name) > 20 else base_name
+            pattern = os.path.join(dir_path, f"{prefix}{suffix}.srt")
+            matches = glob.glob(pattern)
+            if matches:
+                return max(matches, key=os.path.getmtime)
+
+        return ""
+
+    def _get_base_filename(self, filepath: str) -> str:
+        """Legacy alias -- delegates to _get_base_filename_v3 for video files."""
+        return self._get_base_filename_v3(filepath, is_srt=False)
 
     # --- Primary Execution Engines ---
 
     @work(thread=True)
     def execute_pipeline_batch(self, config: dict) -> None:
-        """
-        Execute full translation pipeline on queued files.
+        """Execute the full translation pipeline on all queued files.
 
-        Processes each file through stages: FFmpeg (audio extraction)
-        -> WhisperX (transcription) -> Ollama (translation) -> Rebalance.
-        Runs in background thread to keep UI responsive.
+        Runs sequentially through each file in self.target_files, applying these steps:
+          1. FFmpeg - Extract audio from video (.mkv/.mp4/.ts etc.) to mono WAV
+          2. WhisperX - Transcribe Japanese audio -> SRT with timestamps
+          3. Ollama Translation - Translate Japanese SRT -> English using LLM
+          4. Rebalance - Split long subtitle lines (>85 chars) for readability
+          5. Cleanup - Remove temporary files (WAV, JSON, VTT, TXT, TSV)
 
+        Each step is optional based on config flags (run_ffmpeg, run_whisper, etc.).
+        If any step fails for a file, the pipeline continues to the next file.
+
+        Thread: Runs in background thread (@work). All UI updates use call_from_thread.
         Args:
-            config (dict): Pipeline configuration with keys for each stage
+            config: Dict with boolean flags for each pipeline stage and connection info:
+                {"ip": str, "model": str, "run_ffmpeg": bool, "run_whisper": bool,
+                 "run_translate": bool, "run_rebalance": bool, "run_clean": bool}
         """
         if not self.target_files:
             self.write_thread_log("[red]ERROR: No files selected in queue.[/red]")
             return
 
-        queue_snapshot = list(self.target_files)
+        # Snapshot the queue under lock to protect against concurrent UI mutations.
+        with self._queue_lock:
+            queue_snapshot = list(self.target_files)
         total_files = len(queue_snapshot)
 
+        # Capture profile key on main thread before entering background work,
+        # since get_base_prompt now takes it as an argument (thread safety).
+        profile_key = self.call_from_thread_sync(self._get_profile_key) if hasattr(self, '_profile_cache') else "Generic / Catch-all"
+        # Fallback: read from config values which are safe to access from any thread.
+        profile_key = self._config_values.get("profile", "Generic / Catch-all")
+
         self.write_thread_log(f"\n[bold magenta]=== INITIATING BATCH PIPELINE ({total_files} Files) ===[/bold magenta]")
+
+        success_count = 0
+        fail_count = 0
 
         for idx, original_target in enumerate(queue_snapshot):
             target = original_target
@@ -1237,7 +1390,7 @@ CRITICAL LAWS OF RE-FORMATTING:
                         text=True,
                         encoding="utf-8",
                         errors="ignore",
-                        timeout=300  # 5 minute timeout
+                        timeout=300
                     )
                     if result.returncode == 0 and os.path.exists(wav_out):
                         target = wav_out
@@ -1250,10 +1403,15 @@ CRITICAL LAWS OF RE-FORMATTING:
                     self.write_thread_log("[red]FFmpeg Error: Process timed out after 300 seconds[/red]")
                     pipeline_failed = True
                 except Exception as e:
-                    self.write_thread_log(f"[red]FFmpeg Error: {e}[/red]")
+                    # Always set pipeline_failed for any exception -- prevents WhisperX from
+                    # running on a non-existent WAV file.
                     pipeline_failed = True
+                    self.write_thread_log(f"[red]FFmpeg Error: {e}[/red]")
 
             # Step 2: WhisperX - Transcribe audio to Japanese SRT
+            # Uses large-v3 model for best accuracy on Japanese. Outputs mono SRT with
+            # timestamps aligned to the extracted WAV file. Max line width/count limits
+            # prevent overly wide/subtitle blocks that would need rebalancing later.
             if config["run_whisper"] and target.endswith('.wav') and not pipeline_failed:
                 self.write_thread_log("Running WhisperX (Generating Source SRT)...")
                 try:
@@ -1262,26 +1420,34 @@ CRITICAL LAWS OF RE-FORMATTING:
                            "--max_line_width", "40", "--max_line_count", "2",
                            "--compute_type", "float16", "--output_format", "srt",
                            "--output_dir", target_dir]
-                    result = subprocess.run(cmd, capture_output=True, text=True,
-                                           encoding="utf-8", errors="ignore", timeout=600)
-                    if result.returncode == 0:
-                        expected_srt = os.path.join(target_dir, f"{base_name}_16k_mono.srt")
-                        if os.path.exists(expected_srt):
-                            target = expected_srt
-                            self.write_thread_log("[green]WhisperX transcription complete.[/green]")
-                            self.call_from_thread(self._set_progress, 50,
-                                                 f"Step: WhisperX | File: {idx+1}/{total_files} | Complete")
+
+                    # Use Popen to allow proper cleanup on timeout (fixes resource leak).
+                    process = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        encoding="utf-8", errors="ignore"
+                    )
+                    try:
+                        stdout, stderr = process.communicate(timeout=600)
+                        if process.returncode == 0:
+                            expected_srt = self._find_srt_file_flexible(target_dir, base_name, "_16k_mono")
+                            if expected_srt and os.path.exists(expected_srt):
+                                target = expected_srt
+                                self.write_thread_log("[green]WhisperX transcription complete.[/green]")
+                                self.call_from_thread(self._set_progress, 50,
+                                                     f"Step: WhisperX | File: {idx+1}/{total_files} | Complete")
+                            else:
+                                raise FileNotFoundError("WhisperX did not produce an SRT file.")
                         else:
-                            raise FileNotFoundError("WhisperX did not produce an SRT file.")
-                    else:
-                        stderr_msg = result.stderr.strip() if result.stderr else "Unknown error"
-                        raise RuntimeError(f"WhisperX failed: {stderr_msg}")
-                except subprocess.TimeoutExpired:
-                    self.write_thread_log("[red]WhisperX Error: Process timed out after 600 seconds[/red]")
-                    pipeline_failed = True
+                            stderr_msg = stderr.strip() if stderr else "Unknown error"
+                            raise RuntimeError(f"WhisperX failed: {stderr_msg}")
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                        self.write_thread_log("[red]WhisperX Error: Process timed out after 600 seconds[/red]")
+                        pipeline_failed = True
                 except Exception as e:
-                    self.write_thread_log(f"[red]WhisperX Error: {e}[/red]")
                     pipeline_failed = True
+                    self.write_thread_log(f"[red]WhisperX Error: {e}[/red]")
 
             # Step 3: Ollama Translation - Translate Japanese SRT to English
             if config["run_translate"] and target.endswith('.srt') and not pipeline_failed:
@@ -1290,10 +1456,9 @@ CRITICAL LAWS OF RE-FORMATTING:
                     pipeline_failed = True
                 else:
                     ollama_client = Client(host=config["ip"])
-                    output_srt = os.path.join(target_dir, f"{base_name}-translated.srt")
+                    output_srt = self._safe_output_path(target_dir, base_name, "-translated")
                     self.write_thread_log(f"Starting LLM Translation: {os.path.basename(output_srt)}")
 
-                    # Parse original Japanese blocks for timestamp anchoring
                     jp_blocks_dict = self.parse_srt_blocks(target)
                     blocks = list(jp_blocks_dict.values())
 
@@ -1301,7 +1466,7 @@ CRITICAL LAWS OF RE-FORMATTING:
                         self.write_thread_log("[red]ERROR: No subtitles found in SRT.[/red]")
                         pipeline_failed = True
                     else:
-                        chunk_size = 20  # Process in batches of 20 blocks
+                        chunk_size = 20
                         total_batches = (len(blocks) // chunk_size) + (1 if len(blocks) % chunk_size != 0 else 0)
 
                         self.call_from_thread(self._set_progress, 0,
@@ -1318,18 +1483,20 @@ CRITICAL LAWS OF RE-FORMATTING:
                                     response = ollama_client.chat(
                                         model=config["model"],
                                         messages=[
-                                            {"role": "system", "content": self.get_base_prompt()},
+                                            {"role": "system", "content": self.get_base_prompt(profile_key)},
                                             {"role": "user", "content": f"<subtitles>\n{batch_text}\n</subtitles>"}
                                         ],
                                         options={"temperature": 0.2, "num_ctx": 16384, "num_predict": -1}
                                     )
                                     clean_out = response['message']['content'].replace('```srt','').replace('```','').strip()
 
-                                    # Force the LLM output to conform to the original timestamps
+                                    # Anchor timestamps from original Japanese blocks to preserve sync.
+                                    # The LLM may reorder/modify text but we must keep the original timing.
                                     anchored_out = self.anchor_timestamps(clean_out, jp_blocks_dict)
 
                                     f_out.write(anchored_out + "\n\n")
                                 except Exception as e:
+                                    pipeline_failed = True
                                     self.write_thread_log(f"[red]LLM Error on Batch {batch_num}: {e}[/red]")
 
                                 self.update_telemetry(batch_num, total_batches, start_time)
@@ -1342,118 +1509,126 @@ CRITICAL LAWS OF RE-FORMATTING:
             if config["run_rebalance"] and target.endswith('.srt') and not pipeline_failed:
                 self.rebalance_srt_file(target)
 
-            # Step 5: Cleanup - Remove temporary files
-            if config["run_clean"]:
+            # Step 5: Cleanup - Remove temporary files using pathlib for safety.
+            # Only clean up on success -- if any prior step failed, the temp files may
+            # not exist (WhisperX cleanup) or may be locked by an in-progress process.
+            if config["run_clean"] and not pipeline_failed:
                 self.write_thread_log("Cleaning up temp files...")
-                if os.path.exists(wav_out):
+                wav_path = Path(wav_out)
+                if wav_path.exists():
                     try:
-                        os.remove(wav_out)
-                    except Exception as e:
-                        self.write_thread_log(f"[yellow]Warning: Could not remove temp file {wav_out}: {e}[/yellow]")
-                for ext_to_del in ['.json', '.vtt', '.txt', '.tsv']:
-                    junk = os.path.join(target_dir, f"{base_name}_16k_mono{ext_to_del}")
-                    if os.path.exists(junk):
-                        try:
-                            os.remove(junk)
-                        except Exception as e:
-                            self.write_thread_log(f"[yellow]Warning: Could not remove {junk}: {e}[/yellow]")
+                        wav_path.unlink()
+                    except OSError as e:
+                        self.write_main_log(f"[yellow]Warning: Could not remove {wav_path.name}: {e}[/yellow]")
 
-            # Remove from queue regardless of success/failure
-            if original_target in self.target_files:
-                self.target_files.remove(original_target)
+                for ext_to_del in ['.json', '.vtt', '.txt', '.tsv']:
+                    junk = Path(target_dir) / f"{base_name}_16k_mono{ext_to_del}"
+                    if junk.exists():
+                        try:
+                            junk.unlink()
+                        except OSError as e:
+                            self.write_main_log(f"[yellow]Warning: Could not remove {junk.name}: {e}[/yellow]")
+
+            # Remove from queue and track results. Using helper ensures consistent
+            # behavior regardless of success or failure.
+            self._remove_from_queue(original_target)
 
             if pipeline_failed:
                 self.write_thread_log(f"[red]Pipeline FAILED for {os.path.basename(target)} - moving to next file[/red]")
+                fail_count += 1
             else:
                 self.write_thread_log(f"[green]Completed processing: {os.path.basename(target)}[/green]")
+                success_count += 1
 
-            self.call_from_thread(self._refresh_queue_ui_main_thread)
-
-        self.write_thread_log("\n[bold magenta]=== ALL PIPELINE TASKS COMPLETE ===[/bold magenta]")
+        self.write_thread_log(f"\n[bold magenta]=== ALL PIPELINE TASKS COMPLETE ===[/bold magenta]")
+        self.write_thread_log(f"Results: {success_count} succeeded, {fail_count} failed out of {total_files} files.")
 
     @work(thread=True)
     def execute_patcher_batch(self, ip: str, model: str) -> None:
-        """
-        Execute surgical patching batch on queued SRT files.
+        """Verify & Patch mode: Translate only missing segments in partially-translated SRTs.
 
-        This method handles "Verify & Patch" functionality - it compares
-        partial translated SRTs against their Japanese source to identify
-        missing segments and fills them in via LLM translation. Unlike the
-        full pipeline, this only processes already-translated files that have
-        gaps compared to their source.
+        Unlike the full pipeline, this mode assumes some translation already exists.
+        It compares the Japanese source (.srt or _16k_mono.srt) against the translated
+        file (-translated.srt), finds gaps (Japanese blocks without English translations),
+        and uses Ollama to translate only those missing segments.
+
+        This is useful for:
+          - Resuming interrupted translations
+          - Adding new episodes where only some segments were translated previously
+          - Quick fixes without re-running the full pipeline
 
         Args:
-            ip (str): Ollama server IP/URL
-            model (str): Model name to use for translation
+            ip: Ollama instance URL (e.g., "http://127.0.0.1:11434")
+            model: Model name to use for translation (e.g., "llama3", "mistral")
         """
         if not self.target_files:
             self.write_thread_log("[red]ERROR: No files selected.[/red]")
             return
 
-        # Normalize all paths to absolute to avoid mismatches
-        self.target_files = [os.path.abspath(f) if not os.path.isabs(f) else f for f in self.target_files]
-        queue_snapshot = list(self.target_files)
+        # Ensure all paths are absolute and snapshot under lock.
+        with self._queue_lock:
+            queue_snapshot = [os.path.abspath(f) for f in self.target_files]
         self.write_thread_log(f"\n[bold magenta]=== STARTING VERIFY & PATCH ON {len(queue_snapshot)} QUEUED FILES ===[/bold magenta]")
+
+        # Capture profile key safely from background thread.
+        profile_key = self._config_values.get("profile", "Generic / Catch-all")
 
         for original_target in queue_snapshot:
             target = original_target
             target_dir = os.path.dirname(os.path.abspath(target)) or "."
-            base_name = self._get_base_filename(target)
+            base_name = self._get_base_filename_v3(target, is_srt=True)
 
-            # Verify input is an SRT file (patcher only works on subtitles)
+            # Patcher only works on .srt files -- skip others with a log message.
             if not target.endswith('.srt'):
                 self.write_thread_log(f"[dim]Skipping {os.path.basename(target)}: Patcher requires an .srt file.[/dim]")
-                if original_target in self.target_files:
-                    self.target_files.remove(original_target)
-                    self.call_from_thread(self._refresh_queue_ui_main_thread)
+                self._remove_from_queue(original_target)
                 continue
 
-            # Check for translated SRT (input to patcher is the partially-translated file)
-            trans_file = os.path.join(target_dir, f"{base_name}-translated.srt")
-            if not os.path.exists(trans_file):
+            trans_file = self._find_srt_file_flexible(target_dir, base_name, "-translated")
+            if not trans_file or not os.path.exists(trans_file):
                 self.write_thread_log(f"[dim]Skipping {os.path.basename(target)}: Could not find matching '-translated.srt' file.[/dim]")
-                if original_target in self.target_files:
-                    self.target_files.remove(original_target)
-                    self.call_from_thread(self._refresh_queue_ui_main_thread)
+                self._remove_from_queue(original_target)
                 continue
 
-            # Find Japanese source SRT (either from WhisperX or original)
-            source_jp = os.path.join(target_dir, f"{base_name}_16k_mono.srt")
-            if not os.path.exists(source_jp):
-                source_jp = os.path.join(target_dir, f"{base_name}.srt")
-                if not os.path.exists(source_jp):
+            source_jp = self._find_srt_file_flexible(target_dir, base_name, "_16k_mono")
+            if not source_jp or not os.path.exists(source_jp):
+                source_jp = self._find_srt_file_flexible(target_dir, base_name, "")
+                if not source_jp or not os.path.exists(source_jp):
                     self.write_thread_log(f"[dim]Skipping {os.path.basename(target)}: Could not find original Japanese source (.srt or _16k_mono.srt).[/dim]")
-                    if original_target in self.target_files:
-                        self.target_files.remove(original_target)
-                        self.call_from_thread(self._refresh_queue_ui_main_thread)
+                    self._remove_from_queue(original_target)
                     continue
 
             self.write_thread_log(f"\n[bold yellow]=== INITIATING SURGICAL PATCHER: {os.path.basename(trans_file)} ===[/bold yellow]")
 
-            # Parse both files to identify gaps (Japanese blocks without translation)
+            # Parse both Japanese and translated SRT files into block dictionaries.
+            # Keys are block indices, values are the full SRT block text (number, timestamps, text).
             jp_blocks = self.parse_srt_blocks(source_jp)
             trans_blocks = self.parse_srt_blocks(trans_file)
 
             if not jp_blocks:
                 self.write_thread_log("[red]ERROR: No Japanese source blocks found.[/red]")
+                self._remove_from_queue(original_target)
                 continue
 
-            # Find missing translations (Japanese indices not in translated file)
+            # Find indices present in Japanese but missing from translated file.
+            # These are the segments that need translation.
             missing_indices = [idx for idx in sorted(jp_blocks.keys()) if idx not in trans_blocks]
 
             if not missing_indices:
                 self.write_thread_log("[green]No gaps found - all segments already translated.[/green]")
+                self._remove_from_queue(original_target)
                 continue
 
             self.write_thread_log(f"Found {len(missing_indices)} missing segments. Translating...")
 
-            # Process missing blocks in chunks via LLM
             if not Client:
                 self.write_thread_log("[red]ERROR: 'ollama' package missing.[/red]")
+                self._remove_from_queue(original_target)
                 continue
 
             ollama_client = Client(host=ip)
-            chunk_size = 10  # Smaller chunks for patching to avoid context overflow
+            chunk_size = 10
+            # Calculate total number of batches needed (round up).
             total_chunks = (len(missing_indices) // chunk_size) + (1 if len(missing_indices) % chunk_size != 0 else 0)
 
             self.call_from_thread(self._set_progress, 0, "Status: Patching gaps... | ETA: Calculating...")
@@ -1465,32 +1640,36 @@ CRITICAL LAWS OF RE-FORMATTING:
                 self.write_thread_log(f"Patching Batch {batch_num}/{total_chunks}...")
 
                 try:
-                    # Extract Japanese text for these indices
                     jp_text = "\n\n".join(jp_blocks[idx] for idx in batch_indices if idx in jp_blocks)
 
                     response = ollama_client.chat(
                         model=model,
                         messages=[
-                            {"role": "system", "content": self.get_base_prompt()},
+                            {"role": "system", "content": self.get_base_prompt(profile_key)},
                             {"role": "user", "content": f"<subtitles>\n{jp_text}\n</subtitles>"}
                         ],
                         options={"temperature": 0.2, "num_ctx": 8192, "num_predict": -1}
                     )
 
-                    # Parse and merge translated blocks back into file
                     clean_out = response['message']['content'].replace('```srt', '').replace('```', '').strip()
                     new_blocks = self.parse_srt_blocks_from_string(clean_out)
 
+                    # Safety check: if LLM returned fewer blocks than expected, log the
+                    # truncation so users know some segments were silently dropped.
+                    if len(new_blocks) < len(batch_indices):
+                        self.write_thread_log(f"[yellow]WARNING: LLM returned {len(new_blocks)} blocks but {len(batch_indices)} were requested. First {len(new_blocks)} segments patched; remaining skipped.[/yellow]")
+
                     for idx, block in zip(batch_indices, new_blocks):
-                        trans_blocks[idx] = block  # Merge into existing blocks dict
+                        trans_blocks[idx] = block
 
                 except Exception as e:
                     self.write_thread_log(f"[red]LLM Error on Patch Batch {batch_num}: {e}[/red]")
 
                 self.update_telemetry(batch_num, total_chunks, start_time)
 
-            # Write merged translated file
-            output_srt = trans_file  # Overwrite the partially-translated file
+            output_srt = trans_file
+            # Write the merged SRT file: original translated blocks + newly patched blocks.
+            # Sort by index to maintain proper sequence order.
             with open(output_srt, 'w', encoding='utf-8') as f:
                 for idx in sorted(trans_blocks.keys()):
                     f.write(trans_blocks[idx] + "\n\n")
@@ -1498,28 +1677,52 @@ CRITICAL LAWS OF RE-FORMATTING:
             self.call_from_thread(self._set_progress, 100, "Status: Patching Complete | Speed: 0 | ETA: 00:00:00")
             self.write_thread_log(f"[green]Patching complete for {os.path.basename(trans_file)}.[/green]")
 
-            if original_target in self.target_files:
-                self.target_files.remove(original_target)
-                self.call_from_thread(self._refresh_queue_ui_main_thread)
+            # Remove processed file from queue so users don't re-patch it.
+            self._remove_from_queue(original_target)
 
         self.write_thread_log("\n[bold magenta]=== ALL PATCHING TASKS COMPLETE ===[/bold magenta]")
 
     def parse_srt_blocks_from_string(self, srt_text: str) -> list[str]:
-        """
-        Parse SRT text string into list of block strings (no index keying).
+        """Split raw SRT text into individual block strings.
 
-        Helper method for patcher to extract blocks from LLM output.
+        Uses double newline as delimiter between blocks. Filters out empty blocks
+        that may result from trailing whitespace or extra newlines in the input.
 
         Args:
-            srt_text (str): Raw SRT format text
+            srt_text: Raw SRT content (may include markdown code fences).
 
         Returns:
-            list[str]: List of individual subtitle blocks
+            List of block strings, each containing: index, timestamps, and text.
         """
         if not srt_text.strip():
             return []
         blocks = re.split(r'\n\s*\n', srt_text.strip())
-        return [b for b in blocks if b.strip()]  # Filter empty blocks
+        return [b for b in blocks if b.strip()]
+
+    # --- Prerequisite Check ---
+
+    def _check_prerequisites(self) -> list[str]:
+        """Verify that required external tools are installed and accessible.
+
+        Returns a list of missing tool names. Empty list means all prerequisites met.
+        Called from on_mount() to warn users before the app starts processing files.
+        Missing tools won't crash the app -- they'll fail later when the pipeline tries
+        to invoke them -- but early detection gives better UX.
+
+        Tools checked:
+        - ffmpeg: Audio extraction from video files (.mkv/.mp4/.ts)
+        - whisperx: Japanese transcription and timestamp alignment
+        - ollama Python package: Required for LLM translation via Ollama API
+          (checked via import, not shutil.which since it's a Python package)
+        """
+        missing = []
+        for cmd in ["ffmpeg", "whisperx"]:
+            if shutil.which(cmd) is None:
+                missing.append(cmd)
+        if Client is None:
+            missing.append("ollama package (pip install ollama)")
+        return missing
+
 
 if __name__ == "__main__":
     app = ShowaSync()
