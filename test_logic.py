@@ -2,7 +2,7 @@ import sys, os, re, json, shutil, threading
 from pathlib import Path
 from datetime import timedelta
 
-# Copy the relevant helper functions from ShowaSync3.py
+# Copy the relevant helper functions from ShowaSync.py
 def time_to_ms(t_str):
     h, m, s, ms = map(int, re.split('[:,]', t_str))
     return (h * 3600000) + (m * 60000) + (s * 1000) + ms

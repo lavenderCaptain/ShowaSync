@@ -51,7 +51,7 @@ python test_long_filename.py
 - ✓ Files can be found using flexible matching
 
 ## Files Modified
-- `ShowaSync3.py`: Added `_safe_output_path()` and `_find_srt_file_flexible()` methods
+- `ShowaSync.py`: Added `_safe_output_path()` and `_find_srt_file_flexible()` methods
 - `test_long_filename.py`: New test file to verify the fix
 
 ## How It Works
