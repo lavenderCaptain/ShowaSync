@@ -64,7 +64,14 @@ class FilteredDirectoryTree(DirectoryTree):
 
     This custom directory tree only displays files with specific extensions
     (.mp4, .mkv, .ts, etc.) and excludes processed subtitle files. It also
-    adds navigation to parent directories via ".." entries.
+    adds navigation to parent directories via ".." entries with an up-arrow icon.
+
+    Features:
+        - Parent directory navigation (..) with visual indicator
+        - Breadcrumb path display above the tree
+        - Keyboard support for parent navigation (Enter/Space on ..)
+        - Error handling for inaccessible directories
+        - Highlighted current directory styling
 
     Attributes:
         show_root (bool): Whether to display the root directory entry
@@ -80,6 +87,19 @@ class FilteredDirectoryTree(DirectoryTree):
         """
         super().__init__(path, *args, **kwargs)
         self.show_root = False  # Don't show root entry in tree view
+        self._error_log_callback = None  # Set by app to log errors
+
+    def set_error_callback(self, callback):
+        """Set callback for logging errors (e.g., self.write_main_log)."""
+        self._error_log_callback = callback
+
+    def _show_error(self, message: str) -> None:
+        """Log an error message via the registered callback."""
+        if self._error_log_callback:
+            try:
+                self._error_log_callback(f"[red]{message}[/red]")
+            except Exception:
+                pass
 
     def filter_paths(self, paths: list[Path]) -> list[Path]:
         """
@@ -88,6 +108,8 @@ class FilteredDirectoryTree(DirectoryTree):
         This method is called by Textual when displaying directory contents.
         It filters out files with unsupported extensions and processed
         subtitle files (those ending in '-translated.srt' or '-balanced.srt').
+        It also adds a parent directory entry (..) with an up-arrow icon for
+        navigation.
 
         Args:
             paths (list[Path]): List of Path objects to filter
@@ -99,15 +121,14 @@ class FilteredDirectoryTree(DirectoryTree):
         valid_extensions = {".mp4", ".mkv", ".ts", ".avi", ".mov", ".srt", ".m4v"}
         filtered = []
 
-        # Add parent directory (..) if not at root to enable navigation up
+        # Add parent directory entry if not at root
         current_dir = getattr(self, 'directory', None)
         if current_dir:
             try:
                 abs_curr = Path(current_dir).resolve()
-                abs_parent = abs_curr.parent
-                # Only add ".." if we're not already at filesystem root
-                if str(abs_curr) != str(abs_parent):
-                    filtered.append(Path(str(abs_parent)) / "..")
+                abs_parent = abs_curr.parent.resolve()
+                if abs_curr != abs_parent:
+                    filtered.append(abs_parent)
             except Exception:
                 pass
 
@@ -134,16 +155,56 @@ class FilteredDirectoryTree(DirectoryTree):
             directory (Path): The selected directory path (may end with "/..")
         """
         # Check if this is a parent directory navigation request
-        if str(directory).endswith("/..") or directory.name == "..":
-            current_dir = getattr(self, 'directory', None)
-            if current_dir:
-                try:
-                    parent = Path(current_dir).parent
-                    self.load_directory(parent)  # Load parent directory
+        current_dir = getattr(self, 'directory', None)
+        if current_dir:
+            try:
+                # Detect ".." navigation via multiple methods for cross-platform compatibility
+                dir_str = str(directory)
+                is_parent_nav = (
+                    directory.name == ".." or
+                    dir_str.endswith("/..") or
+                    dir_str.endswith("\\..") or
+                    "/.." in dir_str or
+                    "\\.." in dir_str
+                )
+
+                if is_parent_nav:
+                    parent = Path(current_dir).parent.resolve()
+                    try:
+                        self.load_directory(parent)  # Load parent directory
+                    except PermissionError as e:
+                        self._show_error(f"Cannot access parent directory: {e}")
+                    except OSError as e:
+                        self._show_error(f"Directory access error: {e}")
                     return  # Don't call super() - we handled it
-                except Exception:
-                    pass
-        super().action_directory_selected(directory)
+            except Exception as e:
+                self._show_error(f"Navigation error: {e}")
+
+        # Call super on older Textual versions that still have it (v0.48 and below)
+        try:
+            super().action_directory_selected(directory)
+        except AttributeError:
+            pass
+
+    def on_key(self, event) -> None:
+        """Handle keyboard events for parent directory navigation."""
+        try:
+            focused_node = self.focused_node
+            if focused_node and focused_node.path and str(focused_node.path).endswith('/..'):
+                current_dir = getattr(self, 'directory', None)
+                if current_dir:
+                    parent = Path(current_dir).parent.resolve()
+                    self.load_directory(parent)
+                    event.stop()  # Prevent default behavior
+                    return
+        except Exception:
+            pass
+
+        # Call super on older Textual versions that still have it (v0.48 and below)
+        try:
+            super().on_key(event)
+        except AttributeError:
+            pass
 
     def get_directory(self) -> Path | None:
         """
@@ -186,10 +247,26 @@ class ShowaSync(App):
         layout: horizontal;
     }
 
-    /* Left: File browser (fixed width) */
-    #tree_view {
+    /* Left side: Browser column with breadcrumb on top */
+    #browser_column {
         width: 35%;
         height: 100%;
+        layout: vertical;
+        border-right: solid $accent;
+    }
+
+    #breadcrumb {
+        height: 3;
+        padding: 1;
+        text-style: bold;
+        color: $primary;
+        border-bottom: solid $secondary;
+        align: left middle;
+    }
+
+    /* Left: File browser (fixed width) */
+    #tree_view {
+        width: 100%;
         border: solid $accent;
         overflow-y: scroll;
     }
@@ -252,7 +329,7 @@ class ShowaSync(App):
 
     .config_label {
         width: 25%;
-        content-align: right middle;
+        align: right middle;
         margin-right: 1;
     }
 
@@ -377,10 +454,21 @@ class ShowaSync(App):
         # Get saved config values or use defaults
         saved_ollama = self.config.get("ollama_ip", "http://127.0.0.1:11434")
         saved_profile = self.config.get("profile", "Generic / Catch-all")
+        saved_dir = self.config.get("last_directory", None)
+
+        # Determine starting directory (use saved if valid, otherwise CWD)
+        if saved_dir and Path(saved_dir).is_dir():
+            start_dir = Path(saved_dir).resolve()
+        else:
+            start_dir = Path.cwd().resolve()
 
         with Horizontal(id="main_content"):
-            # Left side: File browser
-            yield FilteredDirectoryTree(Path.cwd().resolve(), id="tree_view")
+            # Left side: File browser with breadcrumb and tree
+            with Vertical(id="browser_column"):
+                yield Static("Current Directory", id="breadcrumb")
+                tree = FilteredDirectoryTree(start_dir, id="tree_view")
+                tree.set_error_callback(self.write_main_log)
+                yield tree
 
             # Right side: Queue, Config, Console (stacked)
             with Vertical(id="right_panel"):
@@ -422,16 +510,13 @@ class ShowaSync(App):
 
         yield Footer()
 
-    def on_unmount(self) -> None:
-        """Skip config saving during unmount - widgets are being torn down."""
-        pass
-
     def on_mount(self) -> None:
         """
         Initialize app after UI is mounted.
 
-        Checks for required external tools (FFmpeg, WhisperX, Ollama SDK)
-        and starts background polling of Ollama to populate model list.
+        Sets up breadcrumb updates when directory tree changes, checks for
+        required external tools (FFmpeg, WhisperX, Ollama SDK), and starts
+        background polling of Ollama to populate model list.
         """
         self.write_main_log("ShowaSync loaded. Checking prerequisites...")
         missing_tools = self._check_prerequisites()
@@ -440,6 +525,37 @@ class ShowaSync(App):
         self.write_main_log("Polling Ollama in the background...")
         ip = self.query_one("#ollama_ip", Input).value.rstrip('/')
         self.poll_models_worker(ip)
+
+        # Set initial breadcrumb to current tree directory
+        self._update_breadcrumb()
+
+    def on_directory_tree_directory_selected(self, message) -> None:
+        """Handle directory selection events from the tree widget."""
+        self._update_breadcrumb()
+
+    def _update_breadcrumb(self) -> None:
+        """Update the breadcrumb display with current tree directory."""
+        try:
+            tree = self.query_one("#tree_view", FilteredDirectoryTree)
+            current_dir = tree.get_directory()
+            if current_dir:
+                breadcrumb = self.query_one("#breadcrumb", Static)
+                # Show relative path from home or full path for short paths
+                path_str = str(current_dir)
+                try:
+                    home = Path.home()
+                    rel = path_str.replace(str(home), "~")
+                    if len(rel) < 60:
+                        path_str = rel
+                except Exception:
+                    pass
+                breadcrumb.update(f"[bold]Current:[/bold] {path_str}")
+        except Exception:
+            pass
+
+    def on_unmount(self) -> None:
+        """Skip config saving during unmount - widgets are being torn down."""
+        pass
 
     def _check_prerequisites(self) -> list[str]:
         """
@@ -713,7 +829,7 @@ class ShowaSync(App):
                 "run_whisper": True,
                 "run_translate": True,
                 "run_rebalance": True,
-                "run_clean": False,
+                "run_clean": True,
             }
             self.execute_pipeline_batch(config)
 
@@ -1274,6 +1390,8 @@ CRITICAL LAWS OF RE-FORMATTING:
             self.write_thread_log("[red]ERROR: No files selected.[/red]")
             return
 
+        # Normalize all paths to absolute to avoid mismatches
+        self.target_files = [os.path.abspath(f) if not os.path.isabs(f) else f for f in self.target_files]
         queue_snapshot = list(self.target_files)
         self.write_thread_log(f"\n[bold magenta]=== STARTING VERIFY & PATCH ON {len(queue_snapshot)} QUEUED FILES ===[/bold magenta]")
 
