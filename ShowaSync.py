@@ -30,6 +30,7 @@ import time
 import json
 import threading
 import shutil
+import platform
 from pathlib import Path
 from datetime import timedelta
 
@@ -1416,9 +1417,15 @@ CRITICAL LAWS OF RE-FORMATTING:
                 self.write_thread_log("Running WhisperX (Generating Source SRT)...")
                 try:
                     start_time = time.time()
+                    # float16 needs a CUDA GPU. macOS has none, so WhisperX
+                    # raises: "Requested float16 compute type, but the target
+                    # device or backend do not support efficient float16
+                    # computation." Fall back to float32 (always supported) on
+                    # macOS; keep the faster float16 on GPU machines.
+                    compute_type = "float32" if platform.system() == "Darwin" else "float16"
                     cmd = ["whisperx", target, "--model", "large-v3", "--language", "ja",
                            "--max_line_width", "40", "--max_line_count", "2",
-                           "--compute_type", "float16", "--output_format", "srt",
+                           "--compute_type", compute_type, "--output_format", "srt",
                            "--output_dir", target_dir]
 
                     # Use Popen to allow proper cleanup on timeout (fixes resource leak).
